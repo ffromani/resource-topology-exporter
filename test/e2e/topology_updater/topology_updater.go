@@ -58,9 +58,13 @@ var _ = ginkgo.Describe("[TopologyUpdater][InfraConsuming] Node topology updater
 
 	f := framework.NewDefaultFramework("topology-updater")
 	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.SkipNamespaceCreation = true
 
 	ginkgo.BeforeEach(func() {
 		var err error
+
+		err = e2etestns.Setup(f)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		if !initialized {
 			timeout, err = time.ParseDuration(e2etestenv.GetPollInterval())
