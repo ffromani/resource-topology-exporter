@@ -23,6 +23,7 @@ package topology_updater
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -231,7 +232,15 @@ var _ = ginkgo.Describe("[TopologyUpdater][InfraConsuming] Node topology updater
 		ginkgo.It("should fill the node resource topologies CR with the data", func() {
 			nodeTopology := e2enodetopology.GetNodeTopology(topologyClient, topologyUpdaterNode.Name)
 			isValid := e2enodetopology.IsValidNodeTopology(nodeTopology, tmPolicy, tmScope)
-			gomega.Expect(isValid).To(gomega.BeTrue(), "received invalid topology: %v", nodeTopology)
+			gomega.Expect(isValid).To(gomega.BeTrue(), "received invalid topology:\n%v", toJSON(nodeTopology))
 		})
 	})
 })
+
+func toJSON(obj interface{}) string {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return "<ERROR>"
+	}
+	return string(data)
+}
