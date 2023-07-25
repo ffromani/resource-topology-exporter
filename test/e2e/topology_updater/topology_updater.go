@@ -23,7 +23,6 @@ package topology_updater
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -36,6 +35,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	k8se2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"sigs.k8s.io/yaml"
 
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	topologyclientset "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
@@ -232,15 +232,15 @@ var _ = ginkgo.Describe("[TopologyUpdater][InfraConsuming] Node topology updater
 		ginkgo.It("should fill the node resource topologies CR with the data", func() {
 			nodeTopology := e2enodetopology.GetNodeTopology(topologyClient, topologyUpdaterNode.Name)
 			isValid := e2enodetopology.IsValidNodeTopology(nodeTopology, tmPolicy, tmScope)
-			gomega.Expect(isValid).To(gomega.BeTrue(), "received invalid topology:\n%v", toJSON(nodeTopology))
+			gomega.Expect(isValid).To(gomega.BeTrue(), "received invalid topology:\n%v", toYAML(nodeTopology))
 		})
 	})
 })
 
-func toJSON(obj interface{}) string {
-	data, err := json.Marshal(obj)
+func toYAML(obj interface{}) string {
+	data, err := yaml.Marshal(obj)
 	if err != nil {
-		return "<ERROR>"
+		return fmt.Sprintf("<SERIALIZE ERROR: %v>", err)
 	}
 	return string(data)
 }
