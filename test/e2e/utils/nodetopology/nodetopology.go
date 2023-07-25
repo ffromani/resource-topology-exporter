@@ -45,6 +45,8 @@ func GetNodeTopology(topologyClient *topologyclientset.Clientset, nodeName strin
 }
 
 func GetNodeTopologyWithResource(topologyClient *topologyclientset.Clientset, nodeName, resName string) *v1alpha2.NodeResourceTopology {
+	framework.Logf("getting information node=%q resource=%q", nodeName, resName)
+
 	var nodeTopology *v1alpha2.NodeResourceTopology
 	var err error
 	gomega.EventuallyWithOffset(1, func() bool {
@@ -58,6 +60,7 @@ func GetNodeTopologyWithResource(topologyClient *topologyclientset.Clientset, no
 		}
 		return containsResource(nodeTopology, resName)
 	}, time.Minute, 5*time.Second).Should(gomega.BeTrue())
+
 	return nodeTopology
 }
 
