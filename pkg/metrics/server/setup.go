@@ -21,12 +21,22 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
-	"k8s.io/klog/v2"
+	"github.com/go-logr/logr"
+
 	ctrlmetricssrv "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/metrics"
 )
+
+type Environ struct {
+	metrics.Environ
+	Mode string
+	Conf Config
+}
 
 const (
 	PortDefault    = 2112
@@ -44,6 +54,18 @@ const (
 	ServingHTTP     = "http" // plaintext
 	ServingHTTPTLS  = "httptls"
 )
+
+func GetAllServingModes() []string {
+	return []string{
+		ServingDisabled,
+		ServingHTTP,
+		ServingHTTPTLS,
+	}
+}
+
+func IsValidServingMode(mode string) bool {
+	return slices.Contains(GetAllServingModes(), mode)
+}
 
 func NewDefaultTLSConfig() TLSConfig {
 	return TLSConfig{
@@ -112,12 +134,7 @@ func ServingModeIsSupported(value string) (string, error) {
 }
 
 func ServingModeSupported() string {
-	modes := []string{
-		ServingDisabled,
-		ServingHTTP,
-		ServingHTTPTLS,
-	}
-	return strings.Join(modes, ",")
+	return strings.Join(GetAllServingModes(), ",")
 }
 
 func PortFromEnv() int {
@@ -127,7 +144,6 @@ func PortFromEnv() int {
 	}
 	port, err := strconv.Atoi(envValue)
 	if err != nil {
-		klog.Warningf("the env variable METRICS_PORT has inccorrect value %q: %v", envValue, err)
 		return 0
 	}
 	return port
@@ -142,38 +158,48 @@ func AddressFromEnv() string {
 }
 
 func Setup(mode string, conf Config) error {
-	if mode == ServingDisabled {
-		klog.Infof("metrics endpoint disabled")
+	return SetupWithEnviron(Environ{
+		Environ: metrics.Environ{
+			Log: logr.Discard(),
+		},
+		Mode: mode,
+		Conf: conf,
+	})
+}
+
+func SetupWithEnviron(env Environ) error {
+	if env.Mode == ServingDisabled {
+		env.Log.Info("metrics endpoint disabled")
 		return nil
 	}
 
-	if err := conf.Validate(); err != nil {
+	if err := env.Conf.Validate(); err != nil {
 		return err
 	}
 
 	var secureServing bool
-	switch mode {
+	switch env.Mode {
 	case ServingHTTP:
 		secureServing = false
 	case ServingHTTPTLS:
 		secureServing = true
 	default:
-		return fmt.Errorf("unknown mode: %v", mode)
+		return fmt.Errorf("unknown mode: %v", env.Mode)
 	}
 
 	opts := ctrlmetricssrv.Options{
 		SecureServing: secureServing,
-		BindAddress:   conf.BindAddress(),
-		CertDir:       conf.TLS.CertsDir,
-		CertName:      conf.TLS.CertFile,
-		KeyName:       conf.TLS.KeyFile,
+		BindAddress:   env.Conf.BindAddress(),
+		CertDir:       env.Conf.TLS.CertsDir,
+		CertName:      env.Conf.TLS.CertFile,
+		KeyName:       env.Conf.TLS.KeyFile,
 		TLSOpts: []func(*tls.Config){
-			WithClientAuth(conf.TLS.WantCliAuth),
+			WithClientAuthLogger(env.Log, env.Conf.TLS.WantCliAuth),
 		},
 	}
 	srv, err := ctrlmetricssrv.NewServer(opts, nil, nil)
 	if err != nil {
-		return fmt.Errorf("failed to build server with port %d: %w", conf.Port, err)
+		return fmt.Errorf("failed to build server with port %d: %w", env.Conf.Port, err)
 	}
 
 	ctx := context.Background()
@@ -181,7 +207,7 @@ func Setup(mode string, conf Config) error {
 	go func() {
 		err := srv.Start(ctx)
 		if err != nil {
-			klog.ErrorS(err, "error starting the controller-runtime metrics server", "config", conf, "options", opts)
+			env.Log.Error(err, "error starting the controller-runtime metrics server", "config", env.Conf, "options", opts)
 		}
 	}()
 
@@ -189,13 +215,17 @@ func Setup(mode string, conf Config) error {
 }
 
 func WithClientAuth(cliAuth bool) func(tlscfg *tls.Config) {
+	return WithClientAuthLogger(logr.Discard(), cliAuth)
+}
+
+func WithClientAuthLogger(lh logr.Logger, cliAuth bool) func(tlscfg *tls.Config) {
 	return func(tlscfg *tls.Config) {
 		if !cliAuth {
 			tlscfg.ClientAuth = tls.NoClientCert
-			klog.InfoS("metrics server configuration", "client authentication", "disabled")
+			lh.Info("metrics server configuration", "client authentication", "disabled")
 			return
 		}
 		tlscfg.ClientAuth = tls.RequireAndVerifyClientCert
-		klog.InfoS("metrics server configuration", "client authentication", "enabled")
+		lh.Info("metrics server configuration", "client authentication", "enabled")
 	}
 }
