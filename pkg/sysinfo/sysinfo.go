@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 
 	v1 "k8s.io/api/core/v1"
+
+	"github.com/go-logr/logr"
 )
 
 const (
@@ -32,6 +34,7 @@ const (
 
 type Handle struct {
 	Root string
+	Log  logr.Logger
 }
 
 func (hnd Handle) SysDevicesNodes() string {

@@ -34,9 +34,9 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
+	"github.com/go-logr/logr"
 	"github.com/jaypipes/ghw"
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
@@ -95,6 +95,7 @@ func (args Args) Clone() Args {
 type Handle struct {
 	PodResCli podresourcesapi.PodResourcesListerClient
 	K8SCli    kubernetes.Interface
+	Log       logr.Logger
 }
 
 type ScanResponse struct {
@@ -149,6 +150,7 @@ type resourceCounter map[v1.ResourceName]int64
 type perNUMAResourceCounter map[int]resourceCounter
 
 type resourceMonitor struct {
+	lh                logr.Logger
 	nodeName          string
 	args              Args
 	podResCli         podresourcesapi.PodResourcesListerClient
@@ -164,6 +166,7 @@ func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)
 		podResCli: hnd.PodResCli,
 		k8sCli:    hnd.K8SCli,
 		args:      args,
+		lh:        hnd.Log,
 	}
 	for _, opt := range options {
 		opt(rm)
@@ -173,7 +176,7 @@ func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)
 		rm.nodeName = os.Getenv("NODE_NAME")
 	}
 
-	klog.Infof("resource monitor for %q starting", rm.nodeName)
+	rm.lh.Info("resource monitor starting", "nodeName", rm.nodeName)
 
 	if rm.topo == nil {
 		topo, err := ghw.Topology(ghw.WithPathOverrides(ghw.PathOverrides{
@@ -185,7 +188,7 @@ func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)
 		rm.topo = topo
 	}
 
-	klog.V(3).Infof("machine topology: %s", toJSON(rm.topo))
+	rm.lh.V(3).Info("machine", "topology", toJSON(rm.topo))
 
 	rm.coreIDToNodeIDMap = MakeCoreIDToNodeIDMap(rm.topo)
 
@@ -193,18 +196,18 @@ func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)
 		return nil, err
 	}
 	if !rm.args.RefreshNodeResources {
-		klog.Infof("getting node resources once")
+		rm.lh.Info("getting node resources once")
 	} else {
-		klog.Infof("tracking node resources")
+		rm.lh.Info("tracking node resources")
 		if err := addNodeInformerEvent(rm.k8sCli, cache.ResourceEventHandlerFuncs{UpdateFunc: rm.resUpdated}); err != nil {
 			return nil, err
 		}
 	}
 
 	if rm.args.Namespace != "" {
-		klog.Infof("watching namespace %q", rm.args.Namespace)
+		rm.lh.Info("watching", "namespace", rm.args.Namespace)
 	} else {
-		klog.Infof("watching all namespaces")
+		rm.lh.Info("watching", "namespace", "all")
 	}
 	return rm, nil
 }
@@ -224,6 +227,12 @@ func WithK8sClient(c kubernetes.Interface) func(*resourceMonitor) {
 func WithNodeName(name string) func(*resourceMonitor) {
 	return func(rm *resourceMonitor) {
 		rm.nodeName = name
+	}
+}
+
+func WithLogger(lh logr.Logger) func(*resourceMonitor) {
+	return func(rm *resourceMonitor) {
+		rm.lh = lh
 	}
 }
 
@@ -259,7 +268,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 			Value: rm.args.PodSetFingerprintMethod,
 		})
 		scanRes.Annotations[podfingerprint.Annotation] = pfpSign
-		klog.V(6).Infof("pfp: " + st.Repr())
+		rm.lh.V(6).Info("pfp", "value", st.Repr())
 	}
 
 	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
@@ -278,7 +287,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
 		if err != nil {
-			klog.Warningf("cannot find costs for NUMA node %d: %v", nodeID, err)
+			rm.lh.Error(err, "cannot find costs for NUMA node", "node", nodeID)
 		} else {
 			zone.Costs = costs
 		}
@@ -313,13 +322,13 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 				// in case of non-native resources, let's tolerate and let's log only when very high levels are requested.
 				// In these cases the admin knows there could be A LOT of data in the logs.
 				if isNativeResource(resName) {
-					klog.Warningf("zero capacity for native resource %q on NUMA cell %d", resName, nodeID)
+					rm.lh.Info("zero capacity detected", "resource", resName, "numaCell", nodeID, "native", "true")
 				} else {
-					klog.V(5).Infof("zero capacity for extra resource %q on NUMA cell %d", resName, nodeID)
+					rm.lh.V(5).Info("zero capacity detected", "resource", resName, "numaCell", nodeID, "native", "false")
 				}
 			}
 			if resAlloc > resCapacity {
-				klog.Warningf("allocated more than capacity for %q on zone %q", resName.String(), zone.Name)
+				rm.lh.Info("allocated more than capacity", "resource", resName.String(), "zone", zone.Name)
 				// we trust more kubelet than ourselves atm.
 				resCapacity = resAlloc
 			}
@@ -328,7 +337,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 			resAvail := resAlloc - resUsed
 			if resAvail < 0 {
-				klog.Warningf("negative size for %q on zone %q", resName.String(), zone.Name)
+				rm.lh.Info("negative size detected", "resource", resName.String(), "zone", zone.Name)
 				resAvail = 0
 			}
 
@@ -347,14 +356,16 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 	if rm.args.PodSetFingerprint && rm.args.PodSetFingerprintStatusFile != "" {
 		dir, file := filepath.Split(rm.args.PodSetFingerprintStatusFile)
 		err := toFile(st, dir, file)
-		klog.V(6).InfoS("error dumping the pfp status", "fullPath", rm.args.PodSetFingerprintStatusFile, "statusFile", file, "err", err)
+		rm.lh.V(6).Info("error dumping the pfp status", "fullPath", rm.args.PodSetFingerprintStatusFile, "statusFile", file, "err", err)
 		// intentionally ignore error, we must keep going.
 	}
 	return scanRes, nil
 }
 
 func (rm *resourceMonitor) updateNodeCapacity() error {
-	memCounters, err := sysinfo.GetMemoryResourceCounters(sysinfo.Handle{})
+	memCounters, err := sysinfo.GetMemoryResourceCounters(sysinfo.Handle{
+		Log: rm.lh,
+	})
 	if err != nil {
 		return err
 	}
@@ -388,9 +399,9 @@ func (rm *resourceMonitor) resUpdated(old, new interface{}) {
 	// the status frequency update are configurable via the node-status-update-frequency option in Kubelet
 	if !reflect.DeepEqual(nOld.Status.Capacity, nNew.Status.Capacity) ||
 		!reflect.DeepEqual(nOld.Status.Allocatable, nNew.Status.Allocatable) {
-		klog.V(2).Infof("update node resources")
+		rm.lh.V(2).Info("update node resources")
 		if err := rm.updateNodeResources(); err != nil {
-			klog.ErrorS(err, "while updating node resources")
+			rm.lh.Error(err, "while updating node resources")
 		}
 	}
 }
@@ -466,7 +477,8 @@ func NormalizeContainerDevices(devices []*podresourcesapi.ContainerDevices, memo
 	for _, cpuID := range cpuIds {
 		nodeID, ok := coreIDToNodeIDMap[int(cpuID)]
 		if !ok {
-			klog.Warningf("cannot find the NUMA node for CPU %d", cpuID)
+			// rm.lh.Info("cannot find the NUMA node", "cpuID", cpuID)
+			// TODO
 			continue
 		}
 		cpusPerNuma[nodeID] = append(cpusPerNuma[nodeID], fmt.Sprintf("%d", cpuID))
@@ -541,7 +553,8 @@ func MakeCoreIDToNodeIDMap(topo *ghw.TopologyInfo) map[int]int {
 			}
 		}
 	}
-	klog.V(5).Infof("CPU mapping: %s", mapIntIntToString(coreToNode))
+	// TODO
+	// rm.lh.V(5).Infof("CPU", "mapping", mapIntIntToString(coreToNode))
 	return coreToNode
 }
 
