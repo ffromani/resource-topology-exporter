@@ -22,7 +22,6 @@ package rte
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -97,63 +96,51 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 		ginkgo.It("[NotificationFile] it should react to pod changes using the smart poller with notification file", func() {
 			initialNodeTopo := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
 
-			stopChan := make(chan struct{})
-			doneChan := make(chan struct{})
-			started := false
+			updateInterval, method, err := estimateUpdateInterval(*initialNodeTopo)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			baselineTimeout := 5*updateInterval + updateIntervalExtraSafety
+			klog.Infof("%s update interval: %s (timeout %s)", method, updateInterval, baselineTimeout)
 
-			go func() {
-				defer ginkgo.GinkgoRecover()
+			ginkgo.By("waiting for a periodic update to find the optimal update window")
+			var baselineNodeTopo *v1alpha2.NodeResourceTopology
+			gomega.Eventually(func(g gomega.Gomega) {
+				var err error
+				baselineNodeTopo, err = f.TopoCli.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), topologyUpdaterNode.Name, metav1.GetOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+				g.Expect(baselineNodeTopo.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(initialNodeTopo.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
+				klog.Infof("resource %s baseline update (resource version %v -> %v)", topologyUpdaterNode.Name, initialNodeTopo.ObjectMeta.ResourceVersion, baselineNodeTopo.ObjectMeta.ResourceVersion)
+			}).WithTimeout(baselineTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get baseline periodic update")
 
-				<-stopChan
-				rtePod, err := e2epods.GetPodOnNode(f.K8SCli, topologyUpdaterNode.Name, e2etestenv.GetNamespaceName(), e2etestenv.RTELabelName)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			ginkgo.By("triggering notification using the file")
+			rtePod, err := e2epods.GetPodOnNode(f.K8SCli, topologyUpdaterNode.Name, e2etestenv.GetNamespaceName(), e2etestenv.RTELabelName)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-				rteContainerName, err := e2ertepod.FindRTEContainerName(rtePod)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			rteContainerName, err := e2ertepod.FindRTEContainerName(rtePod)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-				rteNotifyFilePath, err := e2ertepod.FindNotificationFilePath(rtePod)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			rteNotifyFilePath, err := e2ertepod.FindNotificationFilePath(f.Ctx, f.K8SCli, rtePod)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-				cmd := []string{"/bin/touch", rteNotifyFilePath}
-				_, _, err = remoteexec.CommandOnPod(f.Ctx, f.K8SCli, rtePod, rteContainerName, cmd...)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred(), "failed exec command %v on pod %q", cmd, client.ObjectKeyFromObject(rtePod).String())
-				klog.Infof("notification triggered, exiting")
-				doneChan <- struct{}{}
-			}()
+			cmd := []string{"/bin/touch", rteNotifyFilePath}
+			_, _, err = remoteexec.CommandOnPod(f.Ctx, f.K8SCli, rtePod, rteContainerName, cmd...)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "failed exec command %v on pod %q", cmd, client.ObjectKeyFromObject(rtePod).String())
+			klog.Infof("notification triggered")
 
-			ginkgo.By("getting the updated topology")
-			var err error
+			ginkgo.By("waiting for reactive topology update")
 			var finalNodeTopo *v1alpha2.NodeResourceTopology
-			gomega.Eventually(func() bool {
-				if !started {
-					stopChan <- struct{}{}
-					started = true
-				}
-
+			gomega.Eventually(func(g gomega.Gomega) {
 				finalNodeTopo, err = f.TopoCli.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), topologyUpdaterNode.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Infof("failed to get the node topology resource: %v", err)
-					return false
-				}
-				if finalNodeTopo.ObjectMeta.ResourceVersion == initialNodeTopo.ObjectMeta.ResourceVersion {
-					klog.Infof("resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
-					return false
-				}
+				g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+				g.Expect(finalNodeTopo.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(baselineNodeTopo.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
 
-				klog.Infof("resource %s updated! - resource version bumped (old %v new %v)", topologyUpdaterNode.Name, initialNodeTopo.ObjectMeta.ResourceVersion, finalNodeTopo.ObjectMeta.ResourceVersion)
+				klog.Infof("resource %s updated! - resource version bumped (old %v new %v)", topologyUpdaterNode.Name, baselineNodeTopo.ObjectMeta.ResourceVersion, finalNodeTopo.ObjectMeta.ResourceVersion)
 
 				reason, ok := finalNodeTopo.Annotations[k8sannotations.RTEUpdate]
-				if !ok {
-					klog.Infof("resource %s missing annotation!", topologyUpdaterNode.Name)
-					return false
-				}
-				klog.Infof("resource %s reason %v expected %v", topologyUpdaterNode.Name, reason, nrtupdater.RTEUpdateReactive)
-				return reason == nrtupdater.RTEUpdateReactive
-			}).WithTimeout(31*time.Second).WithPolling(1*time.Second).Should(gomega.BeTrue(), "didn't get updated node topology info")
+				g.Expect(ok).To(gomega.BeTrue(), "resource %s missing annotation!", topologyUpdaterNode.Name)
+				g.Expect(reason).To(gomega.Equal(nrtupdater.RTEUpdateReactive), "resource %s reason %v expected %v", topologyUpdaterNode.Name, reason, nrtupdater.RTEUpdateReactive)
+			}).WithTimeout(baselineTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
+
 			ginkgo.By("checking the topology was updated for the right reason")
-
-			<-doneChan
-
 			gomega.Expect(finalNodeTopo.Annotations).ToNot(gomega.BeNil(), "missing annotations entirely")
 			reason := finalNodeTopo.Annotations[k8sannotations.RTEUpdate]
 			gomega.Expect(reason).To(gomega.Equal(nrtupdater.RTEUpdateReactive), "update reason error: expected %q got %q", nrtupdater.RTEUpdateReactive, reason)
@@ -274,18 +261,19 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 	})
 	ginkgo.Context("with refresh-node-resources enabled", func() {
 		ginkgo.It("[NodeRefresh] should be able to detect devices", func() {
-			gomega.Eventually(func() bool {
+			gomega.Eventually(func(g gomega.Gomega) {
 				nrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
 				devName := e2etestenv.GetDeviceName()
+				found := false
 				for _, zone := range nrt.Zones {
 					for _, res := range zone.Resources {
 						if res.Name == devName {
-							return true
+							found = true
 						}
 					}
 				}
-				return false
-			}).WithTimeout(30*time.Second).WithPolling(10*time.Second).Should(gomega.BeTrue(), "device: %q was not found in NRT: %q", e2etestenv.GetDeviceName(), topologyUpdaterNode.Name)
+				g.Expect(found).To(gomega.BeTrue(), "device: %q was not found in NRT: %q", devName, topologyUpdaterNode.Name)
+			}).WithTimeout(30 * time.Second).WithPolling(10 * time.Second).Should(gomega.Succeed())
 		})
 
 		ginkgo.It("[NodeRefresh] should log the refresh message", func() {
@@ -295,31 +283,30 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 			rteContainerName, err := e2ertepod.FindRTEContainerName(rtePod)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-			gomega.Eventually(func() bool {
+			gomega.Eventually(func(g gomega.Gomega) {
 				logs, err := e2epods.GetLogsForPod(f.K8SCli, rtePod.Namespace, rtePod.Name, rteContainerName)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(err).ToNot(gomega.HaveOccurred())
 
-				return strings.Contains(logs, "tracking node resources") || strings.Contains(logs, "update node resources")
-			}).WithTimeout(42*time.Second).WithPolling(5*time.Second).Should(gomega.BeTrue(), "container: %q in pod: %q doesn't contains the refresh log message", rteContainerName, rtePod.Name)
+				g.Expect(logs).To(gomega.Or(
+					gomega.ContainSubstring("tracking node resources"),
+					gomega.ContainSubstring("update node resources"),
+				), "container: %q in pod: %q doesn't contain the refresh log message", rteContainerName, rtePod.Name)
+			}).WithTimeout(42 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
 		})
 	})
 })
 
 func getUpdatedNRT(topologyClient *topologyclientset.Clientset, nodeName string, prevNrt v1alpha2.NodeResourceTopology, timeout time.Duration) *v1alpha2.NodeResourceTopology {
+	ginkgo.GinkgoHelper()
+	effectiveTimeout := timeout + updateIntervalExtraSafety
+	klog.Infof("waiting for NRT %q update: timeout %v (base %v + safety %v) prev resourceVersion=%v", nodeName, effectiveTimeout, timeout, updateIntervalExtraSafety, prevNrt.ObjectMeta.ResourceVersion)
 	var err error
 	var currNrt *v1alpha2.NodeResourceTopology
-	gomega.EventuallyWithOffset(1, func() bool {
+	gomega.Eventually(func(g gomega.Gomega) {
 		currNrt, err = topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			klog.Infof("failed to get the node topology resource: %v", err)
-			return false
-		}
-		if currNrt.ObjectMeta.ResourceVersion == prevNrt.ObjectMeta.ResourceVersion {
-			klog.Infof("resource %s not yet updated - resource version not bumped", nodeName)
-			return false
-		}
-		return true
-	}).WithTimeout(timeout+updateIntervalExtraSafety).WithPolling(1*time.Second).Should(gomega.BeTrue(), "didn't get updated node topology info")
+		g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+		g.Expect(currNrt.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(prevNrt.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", nodeName)
+	}).WithTimeout(effectiveTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
 	return currNrt
 }
 
@@ -406,7 +393,8 @@ func estimateUpdateInterval(nrt v1alpha2.NodeResourceTopology) (time.Duration, s
 		return fallbackInterval, "estimated", nil
 	}
 	updateInterval, err := time.ParseDuration(updateIntervalAnn)
-	if err != nil {
+	if err != nil || updateInterval <= 0 {
+		klog.Warningf("annotation %q has unusable value %q (parsed=%v err=%v), falling back to %v", k8sannotations.UpdateInterval, updateIntervalAnn, updateInterval, err, fallbackInterval)
 		return fallbackInterval, "estimated", err
 	}
 	return updateInterval, "computed", nil
