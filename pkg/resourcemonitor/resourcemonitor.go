@@ -173,6 +173,7 @@ func (nrc perNUMAResourceCounter) String() string {
 type resourceMonitor struct {
 	nodeName          string
 	args              Args
+	tmPolicy          string
 	podResCli         podresourcesapi.PodResourcesListerClient
 	k8sCli            kubernetes.Interface
 	topo              *ghwtopology.Info
@@ -181,10 +182,11 @@ type resourceMonitor struct {
 	nodeAllocatable   perNUMAResourceCounter
 }
 
-func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)) (*resourceMonitor, error) {
+func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(*resourceMonitor)) (*resourceMonitor, error) {
 	rm := &resourceMonitor{
 		podResCli: hnd.PodResCli,
 		k8sCli:    hnd.K8SCli,
+		tmPolicy:  tmPolicy,
 		args:      args,
 	}
 	for _, opt := range options {
@@ -250,6 +252,10 @@ func WithNodeName(name string) func(*resourceMonitor) {
 	return func(rm *resourceMonitor) {
 		rm.nodeName = name
 	}
+}
+
+func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
+	return rm.tmPolicy == policy
 }
 
 func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, error) {

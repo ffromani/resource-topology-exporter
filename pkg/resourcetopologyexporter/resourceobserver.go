@@ -24,8 +24,8 @@ type ResourceObserver struct {
 	exposeTiming    bool
 }
 
-func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args) (*ResourceObserver, error) {
-	resMon, err := resourcemonitor.NewResourceMonitor(hnd, args)
+func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args, tmPolicy string) (*ResourceObserver, error) {
+	resMon, err := resourcemonitor.NewResourceMonitor(hnd, args, tmPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize ResourceMonitor: %w", err)
 	}
