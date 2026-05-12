@@ -88,7 +88,7 @@ func fromDaemonFiles(pArgs *ProgArgs, configPathRoot string) error {
 
 	confObj := make(map[string]interface{})
 
-	configPath := filepath.Join(configPathRoot, "daemon", "config.yaml")
+	configPath := filepath.Join(configPathRoot, configDirDaemon, "config.yaml")
 	klog.Infof("loading configlet: %q", configPath)
 	err := loadConfiglet(confObj, configPath)
 	if err != nil {
@@ -96,7 +96,7 @@ func fromDaemonFiles(pArgs *ProgArgs, configPathRoot string) error {
 	}
 
 	// this directory may be missing, that's expected and fine
-	configletDir := filepath.Join(configPathRoot, "daemon", "config.yaml.d")
+	configletDir := filepath.Join(configPathRoot, configDirDaemon, "config.yaml.d")
 	if configlets, err := ReadConfigletDir(configletDir); err == nil {
 		for _, configlet := range configlets {
 			if !configlet.Type().IsRegular() {
