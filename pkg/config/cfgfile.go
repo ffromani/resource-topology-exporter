@@ -80,7 +80,7 @@ func fromDaemonFiles(pArgs *ProgArgs, configPathRoot string) error {
 	// 1. we need to distinguish "value not set" from "value with defaults" (language's or our's)
 	//    To do so, using the simple unmashalling is not good enough, because unset values
 	//    will be set to zero values. But we want to LACK unset values, so we know we don't
-	//    apply over the previos iteration, keeping the oldest set value (possibly the default)
+	//    apply over the previous iteration, keeping the latest set value (possibly the default).
 	// 2. hence, we don't use the simple unmarshalling, but we unmarshal to generic maps
 	//    unmarshalled maps will be map[[string]any, possibly nested. But at least we will have
 	//    decoded only the value explicitely given, which makes simple to know when to apply
