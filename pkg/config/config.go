@@ -141,6 +141,7 @@ func LoadArgs(args ...string) (ProgArgs, error) {
 		klog.Infof("config from flags:{{\n%s\n}}", pArgs.ToYAMLString())
 	}
 
+	Canonicalize(&pArgs)
 	err = Validate(&pArgs)
 	if err != nil {
 		return pArgs, err
