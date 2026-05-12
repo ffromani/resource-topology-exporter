@@ -32,7 +32,6 @@ import (
 )
 
 const (
-	DefaultconfigRoot     = "/etc/rte"
 	LegacyExtraConfigPath = "/etc/resource-topology-exporter/config.yaml"
 
 	configDirDaemon = "daemon"
