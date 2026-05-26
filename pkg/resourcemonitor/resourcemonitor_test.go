@@ -37,6 +37,7 @@ import (
 	"google.golang.org/protobuf/testing/protocmp"
 
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	"github.com/k8stopologyawareschedwg/numaplacement"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres"
 )
@@ -361,14 +362,8 @@ func TestNormalizeContainerDevices(t *testing.T) {
 // TODO: add testcase for
 // - a pod with non-integral CPUs and devices, we need to not decrement the CPUs but do that for devices.
 
-func TestResourcesScan(t *testing.T) {
-	fakeTopo := ghwtopology.Info{}
-	Convey("When recovering test topology from JSON data", t, func() {
-		err := json.Unmarshal([]byte(testTopology), &fakeTopo)
-		So(err, ShouldBeNil)
-	})
-
-	allContainerDevices := []*v1.ContainerDevices{
+func getAllContainerDevices() []*v1.ContainerDevices {
+	return []*v1.ContainerDevices{
 		{
 			ResourceName: "fake.io/net",
 			DeviceIds:    []string{"netAAA-0"},
@@ -447,6 +442,15 @@ func TestResourcesScan(t *testing.T) {
 			},
 		},
 	}
+}
+func TestResourcesScan(t *testing.T) {
+	fakeTopo := ghwtopology.Info{}
+	Convey("When recovering test topology from JSON data", t, func() {
+		err := json.Unmarshal([]byte(testTopology), &fakeTopo)
+		So(err, ShouldBeNil)
+	})
+
+	allContainerDevices := getAllContainerDevices()
 
 	Convey("When I aggregate the node resources fake data and no pod allocation", t, func() {
 		availRes := &v1.AllocatableResourcesResponse{
@@ -1381,6 +1385,283 @@ func TestNewResourceMonitorTMConfig(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	assert.True(t, rm.HasTopologyManagerPolicy(tmPolicy))
+}
+
+func TestScanNUMAPlacementAttributes(t *testing.T) {
+	baselineRes := &v1.AllocatableResourcesResponse{
+		Devices: getAllContainerDevices(),
+		// CPUId 0 and 1 are missing from the list below to simulate
+		// that they are not allocatable CPUs (kube-reserved or system-reserved)
+		CpuIds: []int64{
+			2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+			12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+		},
+	}
+
+	fakeTopo := ghwtopology.Info{}
+	Convey("When recovering test topology from JSON data", t, func() {
+		err := json.Unmarshal([]byte(testTopology), &fakeTopo)
+		So(err, ShouldBeNil)
+	})
+
+	newPodResMock := func(listResp *podresourcesapi.ListPodResourcesResponse) *podres.MockPodResourcesListerClient {
+		mockPodResClient := new(podres.MockPodResourcesListerClient)
+		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(baselineRes, nil).Once()
+		if listResp != nil {
+			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(listResp, nil).Once()
+		}
+		return mockPodResClient
+	}
+
+	Convey("When containers are eligible for NUMA placement and are encoded successfully", t, func() {
+		listResp := &podresourcesapi.ListPodResourcesResponse{
+			// mimics the pod resources that are reported by the kubelet for single-numa-node topology
+			// and it's valid to have multiple containers in a pod with the different NUMA node affinity
+			// simulating container topology scope
+			PodResources: []*podresourcesapi.PodResources{
+				// Guaranteed-like: exclusive CPUs.
+				// eligible for numaplacement container encoding
+				{
+					Namespace: "guaranteed-ns",
+					Name:      "pod1",
+					Containers: []*podresourcesapi.ContainerResources{
+						{
+							Name:   "app",
+							CpuIds: []int64{2},
+							Memory: []*podresourcesapi.ContainerMemory{
+								{
+									MemoryType: "memory",
+									Size:       1024,
+									Topology: &podresourcesapi.TopologyInfo{
+										Nodes: []*podresourcesapi.NUMANode{{ID: 0}},
+									},
+								},
+							},
+						},
+						{
+							Name:   "app-2",
+							CpuIds: []int64{4},
+							Memory: []*podresourcesapi.ContainerMemory{
+								{
+									MemoryType: "memory",
+									Size:       1024,
+									Topology: &podresourcesapi.TopologyInfo{
+										Nodes: []*podresourcesapi.NUMANode{{ID: 0}},
+									},
+								},
+							},
+						},
+					},
+				},
+				// Burstable/BestEffort-like: multiple containers; only sidecar has a NUMA-local device and are eligible for numaplacement container encoding.
+				{
+					Namespace: "burst-ns",
+					Name:      "pod2",
+					Containers: []*podresourcesapi.ContainerResources{
+						{Name: "app-shim"},
+						{
+							Name: "sidecar",
+							Devices: []*podresourcesapi.ContainerDevices{
+								{
+									ResourceName: "fake.io/gpu",
+									DeviceIds:    []string{"gpuAAA"},
+									Topology: &podresourcesapi.TopologyInfo{
+										Nodes: []*podresourcesapi.NUMANode{{ID: 1}},
+									},
+								},
+							},
+						},
+					},
+				},
+				// BestEffort/Burstable-like without non-native resources
+				// not eligible for numaplacement container encoding
+				{
+					Namespace: "be-ns",
+					Name:      "pod3",
+					Containers: []*podresourcesapi.ContainerResources{
+						{Name: "c1"},
+						{Name: "c2"},
+					},
+				},
+				// Guaranteed-like with NUMA-local memory (no integer CPUs) - eligible for numaplacement container encoding
+				{
+					Namespace: "mem-ns",
+					Name:      "pod4",
+					Containers: []*podresourcesapi.ContainerResources{
+						{
+							Name: "cnt-mem-1",
+							Memory: []*podresourcesapi.ContainerMemory{
+								{
+									MemoryType: "memory",
+									Size:       1024,
+									Topology: &podresourcesapi.TopologyInfo{
+										Nodes: []*podresourcesapi.NUMANode{{ID: 1}},
+									},
+								},
+							},
+						},
+						{
+							Name: "cnt-mem-2",
+							Memory: []*podresourcesapi.ContainerMemory{
+								{
+									MemoryType: "memory",
+									Size:       1024,
+									Topology: &podresourcesapi.TopologyInfo{
+										Nodes: []*podresourcesapi.NUMANode{{ID: 0}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		mockPodResClient := newPodResMock(listResp)
+
+		resMon, err := NewResourceMonitor(
+			Handle{PodResCli: mockPodResClient},
+			Args{
+				PodSetFingerprint:       true,
+				PodSetFingerprintMethod: podfingerprint.MethodAll, // to ensure the containers are filtered also for this
+			},
+			TopologyManagerPolicySingleNUMANode,
+			WithNodeName("TEST"),
+			WithTopology(&fakeTopo),
+			WithK8sClient(fake.NewSimpleClientset()))
+		So(err, ShouldBeNil)
+
+		scanRes, err := resMon.Scan(ResourceExclude{})
+		So(err, ShouldBeNil)
+
+		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+
+		assert.True(t, ok, "expected %q from encoded container NUMA affinities", numaplacement.AttributeMetadata)
+		assert.True(t, strings.HasPrefix(metaVal, numaplacement.Prefix+numaplacement.Version), "expected LEB89 prefix but got "+metaVal)
+		assert.Contains(t, metaVal, "cc=5")
+		assert.Contains(t, metaVal, "nn=2")
+		assert.Contains(t, metaVal, "bn=0")
+
+		// NUMA 1 has 2 containers at sorted-hash indices 0 and 2; LEB89 delta-encodes as "!#".
+		// **precomputed**
+		expectedVectorForNUMA1 := "!#"
+
+		// check zones attributes
+		for _, zone := range scanRes.Zones {
+			if zone.Name == "node-0" {
+				_, ok := scanAttributeValue(zone.Attributes, numaplacement.AttributeVector)
+				assert.False(t, ok) // because it's the busiest NUMA
+			}
+			if zone.Name == "node-1" {
+				vectorVal, ok := scanAttributeValue(zone.Attributes, numaplacement.AttributeVector)
+				assert.True(t, ok)
+				assert.Equal(t, expectedVectorForNUMA1, vectorVal)
+			}
+		}
+		mockPodResClient.AssertExpectations(t)
+	})
+
+	Convey("When TM config is not supported for NUMA placement, the NUMA placement metadata is reported as unsupported", t, func() {
+		// TM config is not supported for NUMA placement; metadata value is reported as unsupported.
+		listResp := &podresourcesapi.ListPodResourcesResponse{
+			PodResources: []*podresourcesapi.PodResources{
+				{
+					Namespace: "ns",
+					Name:      "pod",
+					Containers: []*podresourcesapi.ContainerResources{
+						{Name: "app", CpuIds: []int64{2}},
+					},
+				},
+			},
+		}
+		mockPodResClient := newPodResMock(listResp)
+
+		rm, err := NewResourceMonitor(
+			Handle{PodResCli: mockPodResClient},
+			Args{
+				PodSetFingerprint:       true,
+				PodSetFingerprintMethod: podfingerprint.MethodAll,
+			},
+			"none",
+			WithNodeName("TEST"),
+			WithTopology(&fakeTopo),
+			WithK8sClient(fake.NewSimpleClientset()))
+		assert.NoError(t, err)
+
+		scanRes, err := rm.Scan(ResourceExclude{})
+		assert.NoError(t, err)
+
+		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+		assert.True(t, ok)
+		assert.Equal(t, unsupportedConfigurationForNumaPlacement, metaVal)
+
+		mockPodResClient.AssertExpectations(t)
+	})
+
+	Convey("When encoding containers NUMA affinities fails, the NUMA placement metadata is reported as error occurred", t, func() {
+		// CpuIds [999] is not in MakeCoreIDToNodeIDMap(testTopology) -> NUMA placement collection is cancelled; metadata value is reported as error occurred.
+		listResp := &podresourcesapi.ListPodResourcesResponse{
+			PodResources: []*podresourcesapi.PodResources{
+				{
+					Namespace: "ns",
+					Name:      "pod",
+					Containers: []*podresourcesapi.ContainerResources{
+						{Name: "bad", CpuIds: []int64{999}},
+					},
+				},
+			},
+		}
+		mockPodResClient := newPodResMock(listResp)
+
+		rm, err := NewResourceMonitor(
+			Handle{PodResCli: mockPodResClient},
+			Args{
+				PodSetFingerprint:       true,
+				PodSetFingerprintMethod: podfingerprint.MethodAll,
+			},
+			TopologyManagerPolicySingleNUMANode,
+			WithNodeName("TEST"),
+			WithTopology(&fakeTopo),
+			WithK8sClient(fake.NewSimpleClientset()))
+		assert.NoError(t, err)
+
+		scanRes, err := rm.Scan(ResourceExclude{})
+		assert.NoError(t, err)
+
+		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+		assert.True(t, ok)
+		assert.Equal(t, errorOccurredDuringNumaPlacementEncoding, metaVal)
+
+		mockPodResClient.AssertExpectations(t)
+	})
+
+	Convey("When PFP is disabled, no NUMA placement metadata is added", t, func() {
+		mockPodResClient := newPodResMock(&podresourcesapi.ListPodResourcesResponse{})
+		rm, err := NewResourceMonitor(
+			Handle{PodResCli: mockPodResClient},
+			Args{PodSetFingerprint: false},
+			TopologyManagerPolicySingleNUMANode,
+			WithNodeName("TEST"),
+			WithTopology(&fakeTopo),
+			WithK8sClient(fake.NewSimpleClientset()))
+		assert.NoError(t, err)
+
+		scanRes, err := rm.Scan(ResourceExclude{})
+		assert.NoError(t, err)
+
+		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+		assert.False(t, ok)
+
+		mockPodResClient.AssertExpectations(t)
+	})
+}
+
+func scanAttributeValue(attrs []topologyv1alpha2.AttributeInfo, name string) (string, bool) {
+	for i := range attrs {
+		if attrs[i].Name == name {
+			return attrs[i].Value, true
+		}
+	}
+	return "", false
 }
 
 func getExpectedCoreToNodeMap() map[int]int {

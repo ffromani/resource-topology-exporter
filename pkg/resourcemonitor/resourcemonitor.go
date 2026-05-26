@@ -40,11 +40,13 @@ import (
 	ghwtopology "github.com/jaypipes/ghw/pkg/topology"
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	"github.com/k8stopologyawareschedwg/numaplacement"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/metrics"
+	numaloclib "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/numalocality"
 	podresfilter "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter"
-	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter/numalocality"
+	numalocfilter "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter/numalocality"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/middleware/podexclude"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/sysinfo"
 )
@@ -52,6 +54,11 @@ import (
 const (
 	defaultPodResourcesTimeout = 10 * time.Second
 	// obtained these values from node e2e tests : https://github.com/kubernetes/kubernetes/blob/82baa26905c94398a0d19e1b1ecf54eb8acb6029/test/e2e_node/util.go#L70
+
+	TopologyManagerPolicySingleNUMANode = "single-numa-node"
+
+	unsupportedConfigurationForNumaPlacement = "unsupported"
+	errorOccurredDuringNumaPlacementEncoding = "error occurred"
 )
 
 type ResourceExclude map[string][]string
@@ -276,8 +283,9 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		Annotations: map[string]string{},
 	}
 
+	var payload numaplacement.Payload
 	if rm.args.PodSetFingerprint {
-		podresVerify := numalocality.Verify
+		podresVerify := numalocfilter.Verify
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
 			podresVerify = podresfilter.VerifyAlwaysPass
 		}
@@ -294,6 +302,145 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		klog.V(6).Infof("resmon: pfp: %s", st.Repr())
 
 		podfingerprint.MarkCompleted(st)
+
+		// computing payload is valuable only on singleNumaNode policy because only under that
+		// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
+		// NUMA placement attribute is worthy to be added only when PFP is enabled so that the
+		// when the consumer decode the data, it would rely on having a matching PFPs.
+		metadata := unsupportedConfigurationForNumaPlacement
+		if rm.tmPolicy == TopologyManagerPolicySingleNUMANode {
+			// we are only interested in pods that are eligible for NUMA placement, which has exclusire resources requests;
+			// container level filtering will be done later
+			candidatePods := []*podresourcesapi.PodResources{}
+			for _, pr := range respPodRes {
+				res := numalocfilter.Verify(pr)
+				if res.Allow {
+					candidatePods = append(candidatePods, pr)
+				}
+			}
+			enc, err := numaplacement.NewEncoder(len(rm.topo.Nodes))
+			if len(candidatePods) == 0 {
+				payload, err = enc.Result()
+				if err != nil {
+					klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
+					metadata = errorOccurredDuringNumaPlacementEncoding
+				}
+			} else {
+				if err != nil {
+					klog.ErrorS(err, "resmon: while creating encoder for containers NUMA affinity")
+					metadata = errorOccurredDuringNumaPlacementEncoding
+				} else {
+					if len(rm.topo.Nodes) == 1 {
+						payload, err = enc.Result()
+						if err != nil {
+							klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
+							metadata = errorOccurredDuringNumaPlacementEncoding
+						}
+					} else {
+						// getting here means that there is at least 2 NUMA nodes and because there must be at least one container eligible for NUMA placement because we depend on PFP verification function
+						klog.Infof("resmon: collecting containers that are eligible for NUMA placement")
+						cntsToEncode := []numaplacement.ContainerAffinity{}
+						getContainerNUMAPlacement := func(cnt *podresourcesapi.ContainerResources, coreIDToNodeIDMap map[int]int) (int, error) {
+							if len(cnt.CpuIds) > 0 {
+								// since this is running on singleNUMANode policy, we can trust that all of the CPUs are on the same NUMA node
+								nodeID, ok := coreIDToNodeIDMap[int(cnt.CpuIds[0])]
+								if !ok {
+									//should never happen
+									return -1, fmt.Errorf("CPU ID %d not found in coreIDToNodeIDMap", cnt.CpuIds[0])
+								}
+								return nodeID, nil
+							}
+
+							//  resources that are considered host-level resources (like ephemeral storage, devices with excludePolicy:"true", etc.),
+							//  are not considered for NUMA placement and they will not have NUMA topology info thus GetNUMAID will return -1
+							for _, dev := range cnt.Devices {
+								if len(dev.DeviceIds) == 0 {
+									continue
+								}
+								nodeIDs := numaloclib.GetNUMAIDs(dev.Topology)
+								if len(nodeIDs) == 0 {
+									continue
+								}
+
+								if len(nodeIDs) > 1 {
+									// should never happen on singleNUMANode policy
+									return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+								}
+								return nodeIDs[0], nil
+							}
+
+							for _, mem := range cnt.Memory {
+								nodeIDs := numaloclib.GetNUMAIDs(mem.Topology)
+								if len(nodeIDs) == 0 {
+									continue
+								}
+
+								if len(nodeIDs) > 1 {
+									// should never happen on singleNUMANode policy
+									return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+								}
+								return nodeIDs[0], nil
+							}
+							return -1, nil
+						}
+
+						cancelCollection := false
+						for _, pr := range candidatePods {
+							if cancelCollection {
+								break
+							}
+							for _, cnt := range pr.Containers {
+								numaNodeID, err := getContainerNUMAPlacement(cnt, rm.coreIDToNodeIDMap)
+								if err != nil {
+									cancelCollection = true
+									break
+								}
+								if numaNodeID == -1 {
+									// it's possible that a container does not belong to specific NUMA node (e.g. using shared pool resources)
+									//  in that case we skip it
+									continue
+								}
+
+								cntsToEncode = append(cntsToEncode, numaplacement.ContainerAffinity{
+									ID: numaplacement.ContainerID{
+										Namespace:     pr.Namespace,
+										PodName:       pr.Name,
+										ContainerName: cnt.Name,
+									},
+									NUMANode: numaNodeID,
+								})
+							}
+						}
+
+						if cancelCollection {
+							metadata = errorOccurredDuringNumaPlacementEncoding
+						} else {
+							enc, err = enc.Encode(cntsToEncode...)
+							if err != nil {
+								klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
+								metadata = errorOccurredDuringNumaPlacementEncoding
+							} else {
+								payload, err = enc.Result()
+								if err != nil {
+									klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
+									metadata = errorOccurredDuringNumaPlacementEncoding
+								}
+								klog.V(6).InfoS("resmon: encoding containers NUMA affinity", "containers", stringifyContainersNUMAPlacement(cntsToEncode), "payload", payload, "error", err)
+							}
+						}
+					}
+				}
+			}
+		}
+		if payload.NUMANodes > 0 {
+			metadata = payload.PackMetadata()
+		}
+		// even if the payload has no containers, we still need to create the metadata attribute
+		// to tell that the current version of RTE supports NUMA placement calculations
+		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
+			Name:  numaplacement.AttributeMetadata,
+			Value: metadata,
+		})
 	}
 
 	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
@@ -301,13 +448,24 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 	excludeSet := excludeList.ToMapSet()
 	zones := make(topologyv1alpha2.ZoneList, 0, len(rm.topo.Nodes))
-	// if there are no allocatable resources under a NUMA we might ended up with holes in the NRT objects.
+	// if there are no allocatable resources under a NUMA we might end up with holes in the NRT objects.
 	// this is why we're using the topology info and not the nodeAllocatable
 	for nodeID := range rm.topo.Nodes {
 		zone := topologyv1alpha2.Zone{
 			Name:      makeZoneName(nodeID),
 			Type:      "Node",
 			Resources: make(topologyv1alpha2.ResourceInfoList, 0),
+		}
+
+		// if there is only one NUMA node then adding the vector attribute is not needed because it will be the busiest
+		if payload.NUMANodes > 1 {
+			zoneVector, ok := payload.Vectors[nodeID]
+			if ok {
+				zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
+					Name:  numaplacement.AttributeVector,
+					Value: zoneVector,
+				})
+			}
 		}
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
@@ -378,6 +536,14 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 	}
 	scanRes.Zones = zones
 	return scanRes, nil
+}
+
+func stringifyContainersNUMAPlacement(affs []numaplacement.ContainerAffinity) string {
+	var sb strings.Builder
+	for _, aff := range affs {
+		sb.WriteString(aff.ID.String() + " -> " + strconv.Itoa(aff.NUMANode) + "\n")
+	}
+	return sb.String()
 }
 
 func (rm *resourceMonitor) updateNodeCapacity() error {
@@ -477,7 +643,7 @@ func collectPodsFromPodResources(podRes []*podresourcesapi.PodResources) string 
 	var sb strings.Builder
 	for _, pr := range podRes {
 		desc := ""
-		nl := numalocality.Verify(pr)
+		nl := numalocfilter.Verify(pr)
 		if nl.Allow {
 			desc = "/" + nl.Ident + "=" + nl.Reason
 		}
