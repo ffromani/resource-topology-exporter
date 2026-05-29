@@ -265,6 +265,7 @@ func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
 	return rm.tmPolicy == policy
 }
 
+// Scan scans the node pods using podresources API, processes the scan response and builds up the returned value.
 func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
 	defer cancel()
@@ -274,10 +275,23 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		return ScanResponse{}, err
 	}
 
-	respPodRes := resp.GetPodResources()
-	klog.V(6).Infof("resmon: podresources list: %s", collectPodsFromPodResources(respPodRes))
+	respRawPodRes := resp.GetPodResources()
+	klog.V(6).Infof("resmon: raw podresources list: %s", stringifyPodResources(respRawPodRes))
 
-	st := podfingerprint.MakeStatus(rm.nodeName)
+	numaEligiblePodRes := []*podresourcesapi.PodResources{}
+	var sb strings.Builder
+	sep := ""
+	for _, pr := range respRawPodRes {
+		nl := numalocfilter.Verify(pr)
+		if !nl.Allow {
+			continue
+		}
+		sb.WriteString(sep + pr.Namespace + "/" + pr.Name + "/" + nl.Ident + "=" + nl.Reason)
+		sep = "  "
+		numaEligiblePodRes = append(numaEligiblePodRes, pr)
+	}
+	klog.V(6).Infof("resmon: numa eligible podresources list: %s", sb.String())
+
 	scanRes := ScanResponse{
 		Attributes:  topologyv1alpha2.AttributeList{},
 		Annotations: map[string]string{},
@@ -285,11 +299,12 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 	var payload *numaplacement.Payload
 	if rm.args.PodSetFingerprint {
-		podresVerify := numalocfilter.Verify
+		st := podfingerprint.MakeStatus(rm.nodeName)
+		pfpPodResources := numaEligiblePodRes
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
-			podresVerify = podresfilter.VerifyAlwaysPass
+			pfpPodResources = respRawPodRes
 		}
-		pfpSign := computePodFingerprintFromPodResources(respPodRes, &st, podresVerify)
+		pfpSign := computePodFingerprintFromPodResources(pfpPodResources, &st, podresfilter.VerifyAlwaysPass)
 		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
 			Name:  podfingerprint.Attribute,
 			Value: pfpSign,
@@ -303,22 +318,10 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 		podfingerprint.MarkCompleted(st)
 
-		// we are only interested in pods that are eligible for NUMA placement, which has exclusive resources requests;
-		// container level filtering will be done later
-		candidatePods := []*podresourcesapi.PodResources{}
-		for _, pr := range respPodRes {
-			res := numalocfilter.Verify(pr)
-			if res.Allow {
-				candidatePods = append(candidatePods, pr)
-			}
-		}
-
-		// NUMA placement attributes are worthy to be added only when PFP is enabled so that the
-		// when the consumer decode the data, it would rely on having a matching PFPs.
-		// numaplacement encoding is only done for pods that are eligible for NUMA placement, which
-		// are a subset of pods that are participating in PFP (it is not always the same pods as PFP
-		// because it depends on the filter function used)
-		payload = ComputeNUMAPlacementPayload(candidatePods, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
+		// numaplacement encoding is only done for pods that are eligible for NUMA placement (with
+		// exclusive resources), which are a subset of pods that are participating in PFP (it is
+		// not always the same pods as PFP because it depends on the filter function used)
+		payload = ComputeNUMAPlacementPayload(numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
 		if payload != nil {
 			metadata := payload.PackMetadata()
 			scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
@@ -328,8 +331,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 			klog.V(6).Infof("resmon: numaplacement metadata: %s", metadata)
 		}
 	}
-
-	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
+	allDevs := GetAllContainerDevices(respRawPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
 	allocated := ContainerDevicesToPerNUMAResourceCounters(allDevs)
 
 	excludeSet := excludeList.ToMapSet()
@@ -559,6 +561,8 @@ func (rm *resourceMonitor) updateNodeResources() error {
 	return nil
 }
 
+// computePodFingerprintFromPodResources computes the pod fingerprint from the given pod resources after applying the filter function to the pod resources.
+// If required that all pods to be included in the fingerprint, pass a no-op verifyFunc that allows all pods.
 func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status, verifyFunc func(*podresourcesapi.PodResources) podresfilter.Result) string {
 	fp := podfingerprint.NewTracingFingerprint(len(podRes), st)
 	for _, pr := range podRes {
@@ -571,22 +575,19 @@ func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResource
 	return fp.Sign()
 }
 
-func collectPodsFromPodResources(podRes []*podresourcesapi.PodResources) string {
+func stringifyPodResources(podRes []*podresourcesapi.PodResources) string {
 	var sb strings.Builder
+	sep := ""
 	for _, pr := range podRes {
-		desc := ""
-		nl := numalocfilter.Verify(pr)
-		if nl.Allow {
-			desc = "/" + nl.Ident + "=" + nl.Reason
-		}
 		// note the separator is 2 spaces
-		sb.WriteString("  " + pr.Namespace + "/" + pr.Name + desc)
+		sb.WriteString(sep + pr.Namespace + "/" + pr.Name)
+		sep = "  "
 	}
 	val := sb.String()
 	if len(val) == 0 {
 		return ""
 	}
-	return val[2:]
+	return val
 }
 
 // GetAllContainerDevices is deprecated and will be unexported in a future version
