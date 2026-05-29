@@ -283,7 +283,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		Annotations: map[string]string{},
 	}
 
-	var payload numaplacement.Payload
+	var payload *numaplacement.Payload
 	if rm.args.PodSetFingerprint {
 		podresVerify := numalocfilter.Verify
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
@@ -303,144 +303,30 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 
 		podfingerprint.MarkCompleted(st)
 
-		// computing payload is valuable only on singleNumaNode policy because only under that
-		// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
-		// NUMA placement attribute is worthy to be added only when PFP is enabled so that the
+		// we are only interested in pods that are eligible for NUMA placement, which has exclusive resources requests;
+		// container level filtering will be done later
+		candidatePods := []*podresourcesapi.PodResources{}
+		for _, pr := range respPodRes {
+			res := numalocfilter.Verify(pr)
+			if res.Allow {
+				candidatePods = append(candidatePods, pr)
+			}
+		}
+
+		// NUMA placement attributes are worthy to be added only when PFP is enabled so that the
 		// when the consumer decode the data, it would rely on having a matching PFPs.
-		metadata := unsupportedConfigurationForNumaPlacement
-		if rm.tmPolicy == TopologyManagerPolicySingleNUMANode {
-			// we are only interested in pods that are eligible for NUMA placement, which has exclusire resources requests;
-			// container level filtering will be done later
-			candidatePods := []*podresourcesapi.PodResources{}
-			for _, pr := range respPodRes {
-				res := numalocfilter.Verify(pr)
-				if res.Allow {
-					candidatePods = append(candidatePods, pr)
-				}
-			}
-			enc, err := numaplacement.NewEncoder(len(rm.topo.Nodes))
-			if len(candidatePods) == 0 {
-				payload, err = enc.Result()
-				if err != nil {
-					klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
-					metadata = errorOccurredDuringNumaPlacementEncoding
-				}
-			} else {
-				if err != nil {
-					klog.ErrorS(err, "resmon: while creating encoder for containers NUMA affinity")
-					metadata = errorOccurredDuringNumaPlacementEncoding
-				} else {
-					if len(rm.topo.Nodes) == 1 {
-						payload, err = enc.Result()
-						if err != nil {
-							klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
-							metadata = errorOccurredDuringNumaPlacementEncoding
-						}
-					} else {
-						// getting here means that there is at least 2 NUMA nodes and because there must be at least one container eligible for NUMA placement because we depend on PFP verification function
-						klog.Infof("resmon: collecting containers that are eligible for NUMA placement")
-						cntsToEncode := []numaplacement.ContainerAffinity{}
-						getContainerNUMAPlacement := func(cnt *podresourcesapi.ContainerResources, coreIDToNodeIDMap map[int]int) (int, error) {
-							if len(cnt.CpuIds) > 0 {
-								// since this is running on singleNUMANode policy, we can trust that all of the CPUs are on the same NUMA node
-								nodeID, ok := coreIDToNodeIDMap[int(cnt.CpuIds[0])]
-								if !ok {
-									//should never happen
-									return -1, fmt.Errorf("CPU ID %d not found in coreIDToNodeIDMap", cnt.CpuIds[0])
-								}
-								return nodeID, nil
-							}
-
-							//  resources that are considered host-level resources (like ephemeral storage, devices with excludePolicy:"true", etc.),
-							//  are not considered for NUMA placement and they will not have NUMA topology info thus GetNUMAID will return -1
-							for _, dev := range cnt.Devices {
-								if len(dev.DeviceIds) == 0 {
-									continue
-								}
-								nodeIDs := numaloclib.GetNUMAIDs(dev.Topology)
-								if len(nodeIDs) == 0 {
-									continue
-								}
-
-								if len(nodeIDs) > 1 {
-									// should never happen on singleNUMANode policy
-									return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
-								}
-								return nodeIDs[0], nil
-							}
-
-							for _, mem := range cnt.Memory {
-								nodeIDs := numaloclib.GetNUMAIDs(mem.Topology)
-								if len(nodeIDs) == 0 {
-									continue
-								}
-
-								if len(nodeIDs) > 1 {
-									// should never happen on singleNUMANode policy
-									return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
-								}
-								return nodeIDs[0], nil
-							}
-							return -1, nil
-						}
-
-						cancelCollection := false
-						for _, pr := range candidatePods {
-							if cancelCollection {
-								break
-							}
-							for _, cnt := range pr.Containers {
-								numaNodeID, err := getContainerNUMAPlacement(cnt, rm.coreIDToNodeIDMap)
-								if err != nil {
-									cancelCollection = true
-									break
-								}
-								if numaNodeID == -1 {
-									// it's possible that a container does not belong to specific NUMA node (e.g. using shared pool resources)
-									//  in that case we skip it
-									continue
-								}
-
-								cntsToEncode = append(cntsToEncode, numaplacement.ContainerAffinity{
-									ID: numaplacement.ContainerID{
-										Namespace:     pr.Namespace,
-										PodName:       pr.Name,
-										ContainerName: cnt.Name,
-									},
-									NUMANode: numaNodeID,
-								})
-							}
-						}
-
-						if cancelCollection {
-							metadata = errorOccurredDuringNumaPlacementEncoding
-						} else {
-							enc, err = enc.Encode(cntsToEncode...)
-							if err != nil {
-								klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
-								metadata = errorOccurredDuringNumaPlacementEncoding
-							} else {
-								payload, err = enc.Result()
-								if err != nil {
-									klog.ErrorS(err, "resmon: while encoding containers NUMA affinity")
-									metadata = errorOccurredDuringNumaPlacementEncoding
-								}
-								klog.V(6).InfoS("resmon: encoding containers NUMA affinity", "containers", stringifyContainersNUMAPlacement(cntsToEncode), "payload", payload, "error", err)
-							}
-						}
-					}
-				}
-			}
+		// numaplacement encoding is only done for pods that are eligible for NUMA placement, which
+		// are a subset of pods that are participating in PFP (it is not always the same pods as PFP
+		// because it depends on the filter function used)
+		payload = ComputeNUMAPlacementPayload(candidatePods, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
+		if payload != nil {
+			metadata := payload.PackMetadata()
+			scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
+				Name:  numaplacement.AttributeMetadata,
+				Value: metadata,
+			})
+			klog.V(6).Infof("resmon: numaplacement metadata: %s", metadata)
 		}
-		if payload.NUMANodes > 0 {
-			metadata = payload.PackMetadata()
-		}
-		// even if the payload has no containers, we still need to create the metadata attribute
-		// to tell that the current version of RTE supports NUMA placement calculations
-		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
-			Name:  numaplacement.AttributeMetadata,
-			Value: metadata,
-		})
 	}
 
 	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
@@ -458,7 +344,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		}
 
 		// if there is only one NUMA node then adding the vector attribute is not needed because it will be the busiest
-		if payload.NUMANodes > 1 {
+		if payload != nil && payload.NUMANodes > 1 {
 			zoneVector, ok := payload.Vectors[nodeID]
 			if ok {
 				zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
@@ -538,12 +424,58 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 	return scanRes, nil
 }
 
-func stringifyContainersNUMAPlacement(affs []numaplacement.ContainerAffinity) string {
-	var sb strings.Builder
-	for _, aff := range affs {
-		sb.WriteString(aff.ID.String() + " -> " + strconv.Itoa(aff.NUMANode) + "\n")
+func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) *numaplacement.Payload {
+	// computing payload is valuable only on singleNumaNode policy because only under that
+	// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
+	if topologyManagerPolicy != TopologyManagerPolicySingleNUMANode {
+		klog.V(4).Infof("resmon: topology manager policy %q is not supported for NUMA placement", topologyManagerPolicy)
+		return nil
 	}
-	return sb.String()
+
+	enc, err := numaplacement.NewEncoder(nodesCount)
+	if err != nil {
+		klog.ErrorS(err, "resmon: while creating NUMA placement encoder")
+		return nil
+	}
+
+	// Important:the consumer should apply the same filter on the pods' containers to be able
+	// to properly decode the attributes' values.
+	klog.V(4).Infof("resmon: collecting containers that are eligible for NUMA placement")
+	for _, pr := range numaEligiblePodRes {
+		for _, cnt := range pr.Containers {
+			cntID := numaplacement.ContainerID{
+				Namespace:     pr.Namespace,
+				PodName:       pr.Name,
+				ContainerName: cnt.Name,
+			}
+			numaNodeID, err := getContainerSingleNUMAPlacement(cnt, coreIDToNodeIDMap)
+			if err != nil {
+				klog.ErrorS(err, "resmon: while getting container NUMA placement", "ident", cntID.String())
+				return nil
+			}
+			if numaNodeID == -1 {
+				// it's possible that a container does not belong to specific NUMA node (e.g. using shared pool resources)
+				//  in that case we skip it
+				continue
+			}
+
+			enc, err = enc.Encode(numaplacement.ContainerAffinity{
+				ID:       cntID,
+				NUMANode: numaNodeID,
+			})
+			if err != nil {
+				klog.ErrorS(err, "resmon: while encoding container NUMA affinity", "ident", cntID.String())
+				return nil
+			}
+		}
+	}
+
+	payload, err := enc.Result()
+	if err != nil {
+		klog.ErrorS(err, "resmon: while getting NUMA placement encoder result")
+		return nil
+	}
+	return &payload
 }
 
 func (rm *resourceMonitor) updateNodeCapacity() error {
@@ -875,4 +807,51 @@ func toJSON(obj interface{}) string {
 		return "<ERROR>"
 	}
 	return string(data)
+}
+
+// getContainerSingleNUMAPlacement returns the NUMA node ID for a container under single-numa-node topology manager policy.
+// It relies on kubelet to guarantee that, hence exits the moment it finds the first non (-1) NUMA ID. if no NUMA affinity
+// is found, it returns -1.
+func getContainerSingleNUMAPlacement(cnt *podresourcesapi.ContainerResources, coreIDToNodeIDMap map[int]int) (int, error) {
+	if len(cnt.CpuIds) > 0 {
+		// since this is running on singleNUMANode policy, we can trust that all of the CPUs are on the same NUMA node
+		nodeID, ok := coreIDToNodeIDMap[int(cnt.CpuIds[0])]
+		if !ok {
+			//should never happen with singleNUMANode policy, but if it does we should not encode any data as it would be unreliable.
+			return -1, fmt.Errorf("CPU ID %d not found in coreIDToNodeIDMap", cnt.CpuIds[0])
+		}
+		return nodeID, nil
+	}
+
+	//  resources that are considered host-level resources (like ephemeral storage, devices with excludePolicy:"true", etc.),
+	//  are not considered for NUMA placement and they will not have NUMA topology info thus GetNUMAID will return -1
+	for _, dev := range cnt.Devices {
+		if len(dev.DeviceIds) == 0 {
+			continue
+		}
+		nodeIDs := numaloclib.GetNUMAIDs(dev.Topology)
+		if len(nodeIDs) == 0 {
+			continue
+		}
+
+		if len(nodeIDs) > 1 {
+			// should never happen on singleNUMANode policy
+			return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+		}
+		return nodeIDs[0], nil
+	}
+
+	for _, mem := range cnt.Memory {
+		nodeIDs := numaloclib.GetNUMAIDs(mem.Topology)
+		if len(nodeIDs) == 0 {
+			continue
+		}
+
+		if len(nodeIDs) > 1 {
+			// should never happen on singleNUMANode policy
+			return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+		}
+		return nodeIDs[0], nil
+	}
+	return -1, nil
 }

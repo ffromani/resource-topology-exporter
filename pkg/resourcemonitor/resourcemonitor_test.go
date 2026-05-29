@@ -1560,7 +1560,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		mockPodResClient.AssertExpectations(t)
 	})
 
-	Convey("When TM config is not supported for NUMA placement, the NUMA placement metadata is reported as unsupported", t, func() {
+	Convey("When TM config is not supported for NUMA placement, the NUMA placement metadata is not set", t, func() {
 		// TM config is not supported for NUMA placement; metadata value is reported as unsupported.
 		listResp := &podresourcesapi.ListPodResourcesResponse{
 			PodResources: []*podresourcesapi.PodResources{
@@ -1590,15 +1590,14 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		scanRes, err := rm.Scan(ResourceExclude{})
 		assert.NoError(t, err)
 
-		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
-		assert.True(t, ok)
-		assert.Equal(t, unsupportedConfigurationForNumaPlacement, metaVal)
+		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+		assert.False(t, ok)
 
 		mockPodResClient.AssertExpectations(t)
 	})
 
-	Convey("When encoding containers NUMA affinities fails, the NUMA placement metadata is reported as error occurred", t, func() {
-		// CpuIds [999] is not in MakeCoreIDToNodeIDMap(testTopology) -> NUMA placement collection is cancelled; metadata value is reported as error occurred.
+	Convey("When encoding containers NUMA affinities fails, the NUMA placement metadata is not set", t, func() {
+		// CpuIds [999] is not in MakeCoreIDToNodeIDMap(testTopology) -> NUMA placement collection is cancelled.
 		listResp := &podresourcesapi.ListPodResourcesResponse{
 			PodResources: []*podresourcesapi.PodResources{
 				{
@@ -1627,9 +1626,8 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		scanRes, err := rm.Scan(ResourceExclude{})
 		assert.NoError(t, err)
 
-		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
-		assert.True(t, ok)
-		assert.Equal(t, errorOccurredDuringNumaPlacementEncoding, metaVal)
+		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+		assert.False(t, ok)
 
 		mockPodResClient.AssertExpectations(t)
 	})
@@ -1653,6 +1651,65 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 
 		mockPodResClient.AssertExpectations(t)
 	})
+}
+
+func TestComputeNUMAPlacementPayload(t *testing.T) {
+	Convey("When the topology manager policy is not a single-numa-node (not supported for numaplacement encoding)", t, func() {
+		payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{
+			{Containers: []*podresourcesapi.ContainerResources{
+				{CpuIds: []int64{0}},
+			}},
+		}, "None", 2, getExpectedCoreToNodeMap())
+		assert.Nil(t, payload)
+	})
+
+	Convey("When the topology manager policy is single-numa-node", t, func() {
+		Convey("With zero pods", func() {
+			numaCount := 2
+			payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			assert.NotNil(t, payload)
+			assert.Equal(t, 0, payload.Containers)
+			assert.Equal(t, 0, payload.BusiestNode)
+		})
+
+		Convey("With valid numa-eligible pods", func() {
+			pods := []*podresourcesapi.PodResources{
+				{
+					//has exclusive CPUs
+					Name:      "tp1",
+					Namespace: "default",
+					Containers: []*podresourcesapi.ContainerResources{
+						{Name: "cnt1", CpuIds: []int64{1}},
+					},
+				},
+				{
+					//burstable/besteffort-like:
+					Name:      "tp2",
+					Namespace: "default",
+					Containers: []*podresourcesapi.ContainerResources{
+						{ //numa-eligible container, reason:device
+							Name: "cnt2",
+							Devices: []*podresourcesapi.ContainerDevices{
+								{ResourceName: "fake.io/gpu", DeviceIds: []string{"gpuAAA"}, Topology: &podresourcesapi.TopologyInfo{Nodes: []*podresourcesapi.NUMANode{{ID: 1}}}},
+							},
+						},
+						{
+							//non-numa-eligible container
+							Name:   "cnt3",
+							CpuIds: []int64{},
+						},
+					},
+				},
+			}
+			numaCount := 2
+			payload := ComputeNUMAPlacementPayload(pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			assert.NotNil(t, payload)
+			assert.Equal(t, 2, payload.Containers)
+			assert.Equal(t, 1, payload.BusiestNode)
+		})
+
+	})
+
 }
 
 func scanAttributeValue(attrs []topologyv1alpha2.AttributeInfo, name string) (string, bool) {
