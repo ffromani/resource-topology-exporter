@@ -74,9 +74,3 @@ func Verify(pr *podresourcesapi.PodResources) podresfilter.Result {
 func AlwaysPass(_ *podresourcesapi.PodResources) bool {
 	return true
 }
-
-// Required is deprecated: use Verify instead
-func Required(pr *podresourcesapi.PodResources) bool {
-	got := Verify(pr)
-	return got.Allow
-}
