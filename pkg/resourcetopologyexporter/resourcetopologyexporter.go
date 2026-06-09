@@ -99,7 +99,7 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 		return err
 	}
 
-	resObs, err := NewResourceObserver(hnd.ResMon, resourcemonitorArgs)
+	resObs, err := NewResourceObserver(hnd.ResMon, resourcemonitorArgs, tmConf.config.Policy)
 	if err != nil {
 		return err
 	}

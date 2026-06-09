@@ -40,11 +40,13 @@ import (
 	ghwtopology "github.com/jaypipes/ghw/pkg/topology"
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	"github.com/k8stopologyawareschedwg/numaplacement"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/metrics"
+	numaloclib "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/numalocality"
 	podresfilter "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter"
-	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter/numalocality"
+	numalocfilter "github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/filter/numalocality"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres/middleware/podexclude"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/sysinfo"
 )
@@ -52,6 +54,11 @@ import (
 const (
 	defaultPodResourcesTimeout = 10 * time.Second
 	// obtained these values from node e2e tests : https://github.com/kubernetes/kubernetes/blob/82baa26905c94398a0d19e1b1ecf54eb8acb6029/test/e2e_node/util.go#L70
+
+	TopologyManagerPolicySingleNUMANode = "single-numa-node"
+
+	unsupportedConfigurationForNumaPlacement = "unsupported"
+	errorOccurredDuringNumaPlacementEncoding = "error occurred"
 )
 
 type ResourceExclude map[string][]string
@@ -173,6 +180,7 @@ func (nrc perNUMAResourceCounter) String() string {
 type resourceMonitor struct {
 	nodeName          string
 	args              Args
+	tmPolicy          string
 	podResCli         podresourcesapi.PodResourcesListerClient
 	k8sCli            kubernetes.Interface
 	topo              *ghwtopology.Info
@@ -181,10 +189,11 @@ type resourceMonitor struct {
 	nodeAllocatable   perNUMAResourceCounter
 }
 
-func NewResourceMonitor(hnd Handle, args Args, options ...func(*resourceMonitor)) (*resourceMonitor, error) {
+func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(*resourceMonitor)) (*resourceMonitor, error) {
 	rm := &resourceMonitor{
 		podResCli: hnd.PodResCli,
 		k8sCli:    hnd.K8SCli,
+		tmPolicy:  tmPolicy,
 		args:      args,
 	}
 	for _, opt := range options {
@@ -252,6 +261,11 @@ func WithNodeName(name string) func(*resourceMonitor) {
 	}
 }
 
+func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
+	return rm.tmPolicy == policy
+}
+
+// Scan scans the node pods using podresources API, processes the scan response and builds up the returned value.
 func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
 	defer cancel()
@@ -261,21 +275,36 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		return ScanResponse{}, err
 	}
 
-	respPodRes := resp.GetPodResources()
-	klog.V(6).Infof("resmon: podresources list: %s", collectPodsFromPodResources(respPodRes))
+	respRawPodRes := resp.GetPodResources()
+	klog.V(6).Infof("resmon: raw podresources list: %s", stringifyPodResources(respRawPodRes))
 
-	st := podfingerprint.MakeStatus(rm.nodeName)
+	numaEligiblePodRes := []*podresourcesapi.PodResources{}
+	var sb strings.Builder
+	sep := ""
+	for _, pr := range respRawPodRes {
+		nl := numalocfilter.Verify(pr)
+		if !nl.Allow {
+			continue
+		}
+		sb.WriteString(sep + pr.Namespace + "/" + pr.Name + "/" + nl.Ident + "=" + nl.Reason)
+		sep = "  "
+		numaEligiblePodRes = append(numaEligiblePodRes, pr)
+	}
+	klog.V(6).Infof("resmon: numa eligible podresources list: %s", sb.String())
+
 	scanRes := ScanResponse{
 		Attributes:  topologyv1alpha2.AttributeList{},
 		Annotations: map[string]string{},
 	}
 
+	var payload *numaplacement.Payload
 	if rm.args.PodSetFingerprint {
-		podresVerify := numalocality.Verify
+		st := podfingerprint.MakeStatus(rm.nodeName)
+		pfpPodResources := numaEligiblePodRes
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
-			podresVerify = podresfilter.VerifyAlwaysPass
+			pfpPodResources = respRawPodRes
 		}
-		pfpSign := computePodFingerprintFromPodResources(respPodRes, &st, podresVerify)
+		pfpSign := computePodFingerprintFromPodResources(pfpPodResources, &st, podresfilter.VerifyAlwaysPass)
 		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
 			Name:  podfingerprint.Attribute,
 			Value: pfpSign,
@@ -288,20 +317,43 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		klog.V(6).Infof("resmon: pfp: %s", st.Repr())
 
 		podfingerprint.MarkCompleted(st)
-	}
 
-	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
+		// numaplacement encoding is only done for pods that are eligible for NUMA placement (with
+		// exclusive resources), which are a subset of pods that are participating in PFP (it is
+		// not always the same pods as PFP because it depends on the filter function used)
+		payload = ComputeNUMAPlacementPayload(numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
+		if payload != nil {
+			metadata := payload.PackMetadata()
+			scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
+				Name:  numaplacement.AttributeMetadata,
+				Value: metadata,
+			})
+			klog.V(6).Infof("resmon: numaplacement metadata: %s", metadata)
+		}
+	}
+	allDevs := GetAllContainerDevices(respRawPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
 	allocated := ContainerDevicesToPerNUMAResourceCounters(allDevs)
 
 	excludeSet := excludeList.ToMapSet()
 	zones := make(topologyv1alpha2.ZoneList, 0, len(rm.topo.Nodes))
-	// if there are no allocatable resources under a NUMA we might ended up with holes in the NRT objects.
+	// if there are no allocatable resources under a NUMA we might end up with holes in the NRT objects.
 	// this is why we're using the topology info and not the nodeAllocatable
 	for nodeID := range rm.topo.Nodes {
 		zone := topologyv1alpha2.Zone{
 			Name:      makeZoneName(nodeID),
 			Type:      "Node",
 			Resources: make(topologyv1alpha2.ResourceInfoList, 0),
+		}
+
+		// if there is only one NUMA node then adding the vector attribute is not needed because it will be the busiest
+		if payload != nil && payload.NUMANodes > 1 {
+			zoneVector, ok := payload.Vectors[nodeID]
+			if ok {
+				zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
+					Name:  numaplacement.AttributeVector,
+					Value: zoneVector,
+				})
+			}
 		}
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
@@ -372,6 +424,60 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 	}
 	scanRes.Zones = zones
 	return scanRes, nil
+}
+
+func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) *numaplacement.Payload {
+	// computing payload is valuable only on singleNumaNode policy because only under that
+	// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
+	if topologyManagerPolicy != TopologyManagerPolicySingleNUMANode {
+		klog.V(4).Infof("resmon: topology manager policy %q is not supported for NUMA placement", topologyManagerPolicy)
+		return nil
+	}
+
+	enc, err := numaplacement.NewEncoder(nodesCount)
+	if err != nil {
+		klog.ErrorS(err, "resmon: while creating NUMA placement encoder")
+		return nil
+	}
+
+	// Important:the consumer should apply the same filter on the pods' containers to be able
+	// to properly decode the attributes' values.
+	klog.V(4).Infof("resmon: collecting containers that are eligible for NUMA placement")
+	for _, pr := range numaEligiblePodRes {
+		for _, cnt := range pr.Containers {
+			cntID := numaplacement.ContainerID{
+				Namespace:     pr.Namespace,
+				PodName:       pr.Name,
+				ContainerName: cnt.Name,
+			}
+			numaNodeID, err := getContainerSingleNUMAPlacement(cnt, coreIDToNodeIDMap)
+			if err != nil {
+				klog.ErrorS(err, "resmon: while getting container NUMA placement", "ident", cntID.String())
+				return nil
+			}
+			if numaNodeID == -1 {
+				// it's possible that a container does not belong to specific NUMA node (e.g. using shared pool resources)
+				//  in that case we skip it
+				continue
+			}
+
+			enc, err = enc.Encode(numaplacement.ContainerAffinity{
+				ID:       cntID,
+				NUMANode: numaNodeID,
+			})
+			if err != nil {
+				klog.ErrorS(err, "resmon: while encoding container NUMA affinity", "ident", cntID.String())
+				return nil
+			}
+		}
+	}
+
+	payload, err := enc.Result()
+	if err != nil {
+		klog.ErrorS(err, "resmon: while getting NUMA placement encoder result")
+		return nil
+	}
+	return &payload
 }
 
 func (rm *resourceMonitor) updateNodeCapacity() error {
@@ -455,6 +561,8 @@ func (rm *resourceMonitor) updateNodeResources() error {
 	return nil
 }
 
+// computePodFingerprintFromPodResources computes the pod fingerprint from the given pod resources after applying the filter function to the pod resources.
+// If required that all pods to be included in the fingerprint, pass a no-op verifyFunc that allows all pods.
 func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status, verifyFunc func(*podresourcesapi.PodResources) podresfilter.Result) string {
 	fp := podfingerprint.NewTracingFingerprint(len(podRes), st)
 	for _, pr := range podRes {
@@ -467,22 +575,19 @@ func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResource
 	return fp.Sign()
 }
 
-func collectPodsFromPodResources(podRes []*podresourcesapi.PodResources) string {
+func stringifyPodResources(podRes []*podresourcesapi.PodResources) string {
 	var sb strings.Builder
+	sep := ""
 	for _, pr := range podRes {
-		desc := ""
-		nl := numalocality.Verify(pr)
-		if nl.Allow {
-			desc = "/" + nl.Ident + "=" + nl.Reason
-		}
 		// note the separator is 2 spaces
-		sb.WriteString("  " + pr.Namespace + "/" + pr.Name + desc)
+		sb.WriteString(sep + pr.Namespace + "/" + pr.Name)
+		sep = "  "
 	}
 	val := sb.String()
 	if len(val) == 0 {
 		return ""
 	}
-	return val[2:]
+	return val
 }
 
 // GetAllContainerDevices is deprecated and will be unexported in a future version
@@ -703,4 +808,51 @@ func toJSON(obj interface{}) string {
 		return "<ERROR>"
 	}
 	return string(data)
+}
+
+// getContainerSingleNUMAPlacement returns the NUMA node ID for a container under single-numa-node topology manager policy.
+// It relies on kubelet to guarantee that, hence exits the moment it finds the first non (-1) NUMA ID. if no NUMA affinity
+// is found, it returns -1.
+func getContainerSingleNUMAPlacement(cnt *podresourcesapi.ContainerResources, coreIDToNodeIDMap map[int]int) (int, error) {
+	if len(cnt.CpuIds) > 0 {
+		// since this is running on singleNUMANode policy, we can trust that all of the CPUs are on the same NUMA node
+		nodeID, ok := coreIDToNodeIDMap[int(cnt.CpuIds[0])]
+		if !ok {
+			//should never happen with singleNUMANode policy, but if it does we should not encode any data as it would be unreliable.
+			return -1, fmt.Errorf("CPU ID %d not found in coreIDToNodeIDMap", cnt.CpuIds[0])
+		}
+		return nodeID, nil
+	}
+
+	//  resources that are considered host-level resources (like ephemeral storage, devices with excludePolicy:"true", etc.),
+	//  are not considered for NUMA placement and they will not have NUMA topology info thus GetNUMAID will return -1
+	for _, dev := range cnt.Devices {
+		if len(dev.DeviceIds) == 0 {
+			continue
+		}
+		nodeIDs := numaloclib.GetNUMAIDs(dev.Topology)
+		if len(nodeIDs) == 0 {
+			continue
+		}
+
+		if len(nodeIDs) > 1 {
+			// should never happen on singleNUMANode policy
+			return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+		}
+		return nodeIDs[0], nil
+	}
+
+	for _, mem := range cnt.Memory {
+		nodeIDs := numaloclib.GetNUMAIDs(mem.Topology)
+		if len(nodeIDs) == 0 {
+			continue
+		}
+
+		if len(nodeIDs) > 1 {
+			// should never happen on singleNUMANode policy
+			return -1, fmt.Errorf("multiple NUMA nodes found for container %s", cnt.Name)
+		}
+		return nodeIDs[0], nil
+	}
+	return -1, nil
 }
