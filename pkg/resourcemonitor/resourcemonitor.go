@@ -296,18 +296,15 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 	logger.V(6).Info("raw podresources list", "podresources", stringifyPodResources(respRawPodRes))
 
 	numaEligiblePodRes := []*podresourcesapi.PodResources{}
-	var sb strings.Builder
-	sep := ""
 	for _, pr := range respRawPodRes {
 		nl := numalocfilter.Verify(pr)
 		if !nl.Allow {
+			logger.V(8).Info("podresources item: not eligible for NUMA", "pod", pr.Namespace+"/"+pr.Name, "ident", nl.Ident, "reason", nl.Reason)
 			continue
 		}
-		sb.WriteString(sep + pr.Namespace + "/" + pr.Name + "/" + nl.Ident + "=" + nl.Reason)
-		sep = "  "
 		numaEligiblePodRes = append(numaEligiblePodRes, pr)
 	}
-	logger.V(6).Info("numa eligible podresources list", "podresources", sb.String())
+	logger.V(6).Info("NUMA eligible podresources list", "podresources", stringifyPodResources(numaEligiblePodRes))
 
 	scanRes := ScanResponse{
 		Attributes:  topologyv1alpha2.AttributeList{},
