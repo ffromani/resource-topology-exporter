@@ -36,6 +36,8 @@ import (
 	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 
+	"github.com/go-logr/logr"
+
 	ghwoption "github.com/jaypipes/ghw/pkg/option"
 	ghwtopology "github.com/jaypipes/ghw/pkg/topology"
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
@@ -188,6 +190,7 @@ type resourceMonitor struct {
 	coreIDToNodeIDMap map[int]int
 	nodeCapacity      perNUMAResourceCounter
 	nodeAllocatable   perNUMAResourceCounter
+	scanIteration     uint64
 }
 
 func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(*resourceMonitor)) *resourceMonitor {
@@ -208,8 +211,15 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 	return rm
 }
 
+func (rm *resourceMonitor) GetScanIteration() string {
+	val := rm.scanIteration
+	rm.scanIteration++
+	return fmt.Sprintf("%v", val)
+}
+
 func (rm *resourceMonitor) Setup(ctx context.Context) error {
-	klog.Infof("resmon: starting for node %q", rm.nodeName)
+	logger := klog.FromContext(ctx).WithValues("node", rm.nodeName)
+	logger.Info("starting")
 
 	if rm.topo == nil {
 		topo, err := ghwtopology.New(ghwoption.WithPathOverrides(ghwoption.PathOverrides{
@@ -220,30 +230,30 @@ func (rm *resourceMonitor) Setup(ctx context.Context) error {
 		}
 		rm.topo = topo
 	}
-	klog.V(4).Infof("resmon: machine topology: %s", toJSON(rm.topo))
+	logger.V(4).Info("machine topology", "topology", toJSON(rm.topo))
 
 	rm.coreIDToNodeIDMap = MakeCoreIDToNodeIDMap(rm.topo)
-	klog.V(4).Infof("resmon: CPU mapping [coreid:numaid]: %s", mapIntIntToString(rm.coreIDToNodeIDMap))
+	logger.V(4).Info("CPU mapping", "coreIDToNodeID", mapIntIntToString(rm.coreIDToNodeIDMap))
 
 	if err := rm.updateNodeResources(ctx); err != nil {
 		return err
 	}
-	klog.V(2).Infof("resmon: initial capacity for node %q: %s", rm.nodeName, rm.nodeCapacity)
-	klog.V(2).Infof("resmon: initial allocatable for node %q: %s", rm.nodeName, rm.nodeAllocatable)
+	logger.V(2).Info("initial capacity", "capacity", rm.nodeCapacity)
+	logger.V(2).Info("initial allocatable", "allocatable", rm.nodeAllocatable)
 
 	if !rm.args.RefreshNodeResources {
-		klog.Infof("resmon: getting node resources once")
+		logger.Info("getting node resources once")
 	} else {
-		klog.Infof("resmon: tracking node resources")
+		logger.Info("tracking node resources")
 		if err := addNodeInformerEvent(rm.k8sCli, cache.ResourceEventHandlerFuncs{UpdateFunc: rm.resUpdated}); err != nil {
 			return err
 		}
 	}
 
 	if rm.args.Namespace != "" {
-		klog.Infof("resmon: watching namespace %q", rm.args.Namespace)
+		logger.Info("watching namespace", "namespace", rm.args.Namespace)
 	} else {
-		klog.Infof("resmon: watching all namespaces")
+		logger.Info("watching all namespaces")
 	}
 	return nil
 }
@@ -272,6 +282,8 @@ func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
 
 // Scan scans the node pods using podresources API, processes the scan response and builds up the returned value.
 func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude) (ScanResponse, error) {
+	logger := klog.FromContext(ctx).WithName("resmon").WithValues("scanID", rm.GetScanIteration())
+
 	ctx, cancel := context.WithTimeout(ctx, defaultPodResourcesTimeout)
 	defer cancel()
 	resp, err := rm.podResCli.List(ctx, &podresourcesapi.ListPodResourcesRequest{})
@@ -281,7 +293,7 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 	}
 
 	respRawPodRes := resp.GetPodResources()
-	klog.V(6).Infof("resmon: raw podresources list: %s", stringifyPodResources(respRawPodRes))
+	logger.V(6).Info("raw podresources list", "podresources", stringifyPodResources(respRawPodRes))
 
 	numaEligiblePodRes := []*podresourcesapi.PodResources{}
 	var sb strings.Builder
@@ -295,7 +307,7 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 		sep = "  "
 		numaEligiblePodRes = append(numaEligiblePodRes, pr)
 	}
-	klog.V(6).Infof("resmon: numa eligible podresources list: %s", sb.String())
+	logger.V(6).Info("numa eligible podresources list", "podresources", sb.String())
 
 	scanRes := ScanResponse{
 		Attributes:  topologyv1alpha2.AttributeList{},
@@ -319,25 +331,25 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 			Value: rm.args.PodSetFingerprintMethod,
 		})
 		scanRes.Annotations[podfingerprint.Annotation] = pfpSign
-		klog.V(6).Infof("resmon: pfp: %s", st.Repr())
+		logger.V(6).Info("pod fingerprint", "status", st.Repr())
 
 		podfingerprint.MarkCompleted(st)
 
 		// numaplacement encoding is only done for pods that are eligible for NUMA placement (with
 		// exclusive resources), which are a subset of pods that are participating in PFP (it is
 		// not always the same pods as PFP because it depends on the filter function used)
-		payload = ComputeNUMAPlacementPayload(numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
+		payload = ComputeNUMAPlacementPayload(logger, numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
 		if payload != nil {
 			metadata := payload.PackMetadata()
 			scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
 				Name:  numaplacement.AttributeMetadata,
 				Value: metadata,
 			})
-			klog.V(6).Infof("resmon: numaplacement metadata: %s", metadata)
+			logger.V(6).Info("numaplacement metadata", "metadata", metadata)
 		}
 	}
-	allDevs := GetAllContainerDevices(respRawPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
-	allocated := ContainerDevicesToPerNUMAResourceCounters(allDevs)
+	allDevs := GetAllContainerDevices(logger, respRawPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
+	allocated := ContainerDevicesToPerNUMAResourceCounters(logger, allDevs)
 
 	excludeSet := excludeList.ToMapSet()
 	zones := make(topologyv1alpha2.ZoneList, 0, len(rm.topo.Nodes))
@@ -363,7 +375,7 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
 		if err != nil {
-			klog.Warningf("resmon: cannot find costs for NUMA node %d: %v", nodeID, err)
+			logger.V(1).Info("cannot find costs for NUMA node", "nodeID", nodeID, "err", err)
 		} else {
 			zone.Costs = costs
 		}
@@ -398,13 +410,13 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 				// in case of non-native resources, let's tolerate and let's log only when very high levels are requested.
 				// In these cases the admin knows there could be A LOT of data in the logs.
 				if isNativeResource(resName) {
-					klog.Warningf("resmon: zero capacity for native resource %q on NUMA cell %d", resName, nodeID)
+					logger.V(1).Info("zero capacity for native resource", "resource", resName, "numaCell", nodeID)
 				} else {
-					klog.V(5).Infof("resmon: zero capacity for extra resource %q on NUMA cell %d", resName, nodeID)
+					logger.V(5).Info("zero capacity for extra resource", "resource", resName, "numaCell", nodeID)
 				}
 			}
 			if resAlloc > resCapacity {
-				klog.Warningf("resmon: allocated more than capacity for %q on zone %q", resName.String(), zone.Name)
+				logger.V(1).Info("allocated more than capacity", "resource", resName, "zone", zone.Name)
 				// we trust more kubelet than ourselves atm.
 				resCapacity = resAlloc
 			}
@@ -413,7 +425,7 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 
 			resAvail := resAlloc - resUsed
 			if resAvail < 0 {
-				klog.Warningf("resmon: negative size for %q on zone %q", resName.String(), zone.Name)
+				logger.V(1).Info("negative size", "resource", resName, "zone", zone.Name)
 				resAvail = 0
 			}
 
@@ -431,23 +443,23 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 	return scanRes, nil
 }
 
-func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) *numaplacement.Payload {
+func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) *numaplacement.Payload {
 	// computing payload is valuable only on singleNumaNode policy because only under that
 	// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
 	if topologyManagerPolicy != TopologyManagerPolicySingleNUMANode {
-		klog.V(4).Infof("resmon: topology manager policy %q is not supported for NUMA placement", topologyManagerPolicy)
+		logger.V(4).Info("topology manager policy not supported for NUMA placement", "policy", topologyManagerPolicy)
 		return nil
 	}
 
 	enc, err := numaplacement.NewEncoder(nodesCount)
 	if err != nil {
-		klog.ErrorS(err, "resmon: while creating NUMA placement encoder")
+		logger.Error(err, "while creating NUMA placement encoder")
 		return nil
 	}
 
 	// Important:the consumer should apply the same filter on the pods' containers to be able
 	// to properly decode the attributes' values.
-	klog.V(4).Infof("resmon: collecting containers that are eligible for NUMA placement")
+	logger.V(4).Info("collecting containers that are eligible for NUMA placement")
 	for _, pr := range numaEligiblePodRes {
 		for _, cnt := range pr.Containers {
 			cntID := numaplacement.ContainerID{
@@ -457,7 +469,7 @@ func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResour
 			}
 			numaNodeID, err := getContainerSingleNUMAPlacement(cnt, coreIDToNodeIDMap)
 			if err != nil {
-				klog.ErrorS(err, "resmon: while getting container NUMA placement", "ident", cntID.String())
+				logger.Error(err, "while getting container NUMA placement", "ident", cntID.String())
 				return nil
 			}
 			if numaNodeID == -1 {
@@ -471,7 +483,7 @@ func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResour
 				NUMANode: numaNodeID,
 			})
 			if err != nil {
-				klog.ErrorS(err, "resmon: while encoding container NUMA affinity", "ident", cntID.String())
+				logger.Error(err, "while encoding container NUMA affinity", "ident", cntID.String())
 				return nil
 			}
 		}
@@ -479,7 +491,7 @@ func ComputeNUMAPlacementPayload(numaEligiblePodRes []*podresourcesapi.PodResour
 
 	payload, err := enc.Result()
 	if err != nil {
-		klog.ErrorS(err, "resmon: while getting NUMA placement encoder result")
+		logger.Error(err, "while getting NUMA placement encoder result")
 		return nil
 	}
 	return &payload
@@ -517,17 +529,18 @@ func (rm *resourceMonitor) resUpdated(old, new interface{}) {
 		return
 	}
 
-	// the status frequency update are configurable via the node-status-update-frequency option in Kubelet
 	if !reflect.DeepEqual(nOld.Status.Capacity, nNew.Status.Capacity) ||
 		!reflect.DeepEqual(nOld.Status.Allocatable, nNew.Status.Allocatable) {
-		klog.V(2).Infof("resmon: update node resources")
+		logger := klog.TODO()
+		logger.V(2).Info("update node resources")
 		if err := rm.updateNodeResources(context.TODO()); err != nil {
-			klog.ErrorS(err, "resmon: while updating node resources")
+			logger.Error(err, "while updating node resources")
 		}
 	}
 }
 
 func (rm *resourceMonitor) updateNodeAllocatable(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
 	ctx, cancel := context.WithTimeout(ctx, defaultPodResourcesTimeout)
 	defer cancel()
 	allocRes, err := rm.podResCli.GetAllocatableResources(ctx, &podresourcesapi.AllocatableResourcesRequest{})
@@ -536,8 +549,8 @@ func (rm *resourceMonitor) updateNodeAllocatable(ctx context.Context) error {
 		return err
 	}
 
-	allDevs := NormalizeContainerDevices(klog.V(4), allocRes.GetDevices(), allocRes.GetMemory(), allocRes.GetCpuIds(), rm.coreIDToNodeIDMap)
-	rm.nodeAllocatable = ContainerDevicesToPerNUMAResourceCounters(allDevs)
+	allDevs := NormalizeContainerDevices(logger, allocRes.GetDevices(), allocRes.GetMemory(), allocRes.GetCpuIds(), rm.coreIDToNodeIDMap)
+	rm.nodeAllocatable = ContainerDevicesToPerNUMAResourceCounters(logger, allDevs)
 	return nil
 }
 
@@ -596,15 +609,14 @@ func stringifyPodResources(podRes []*podresourcesapi.PodResources) string {
 }
 
 // GetAllContainerDevices is deprecated and will be unexported in a future version
-func GetAllContainerDevices(podRes []*podresourcesapi.PodResources, namespace string, coreIDToNodeIDMap map[int]int) []*podresourcesapi.ContainerDevices {
+func GetAllContainerDevices(logger logr.Logger, podRes []*podresourcesapi.PodResources, namespace string, coreIDToNodeIDMap map[int]int) []*podresourcesapi.ContainerDevices {
 	allCntRes := []*podresourcesapi.ContainerDevices{}
 	for _, pr := range podRes {
-		// filter by namespace (if given)
 		if namespace != "" && namespace != pr.GetNamespace() {
 			continue
 		}
 		for _, cnt := range pr.GetContainers() {
-			allCntRes = append(allCntRes, NormalizeContainerDevices(klog.V(8), cnt.GetDevices(), cnt.GetMemory(), cnt.GetCpuIds(), coreIDToNodeIDMap)...)
+			allCntRes = append(allCntRes, NormalizeContainerDevices(logger, cnt.GetDevices(), cnt.GetMemory(), cnt.GetCpuIds(), coreIDToNodeIDMap)...)
 		}
 	}
 	return allCntRes
@@ -622,25 +634,24 @@ func ComputePodFingerprint(podRes []*podresourcesapi.PodResources, st *podfinger
 	return fp.Sign()
 }
 
-func NormalizeContainerDevices(lh klog.Verbose, devices []*podresourcesapi.ContainerDevices, memoryBlocks []*podresourcesapi.ContainerMemory, cpuIds []int64, coreIDToNodeIDMap map[int]int) []*podresourcesapi.ContainerDevices {
-	lh.Infof("normalizing container devices: from devices=%d memoryBlocks=%d CPUs=%d", len(devices), len(memoryBlocks), len(cpuIds))
+func NormalizeContainerDevices(logger logr.Logger, devices []*podresourcesapi.ContainerDevices, memoryBlocks []*podresourcesapi.ContainerMemory, cpuIds []int64, coreIDToNodeIDMap map[int]int) []*podresourcesapi.ContainerDevices {
+	logger.V(4).Info("normalizing container devices", "devices", len(devices), "memoryBlocks", len(memoryBlocks), "CPUs", len(cpuIds))
 
-	lh.Infof("normalize Devices count=%d", len(devices))
+	logger.V(4).Info("normalize devices", "count", len(devices))
 	contDevs := append([]*podresourcesapi.ContainerDevices{}, devices...)
 
 	cpusPerNuma := make(map[int][]string)
 	for _, cpuID := range cpuIds {
 		nodeID, ok := coreIDToNodeIDMap[int(cpuID)]
 		if !ok {
-			// this must be logged unconditionally, so we use klog directly
-			klog.Warningf("resmon: cannot find the NUMA node for CPU %d", cpuID)
+			logger.V(1).Info("cannot find the NUMA node for CPU", "cpuID", cpuID)
 			continue
 		}
 		cpusPerNuma[nodeID] = append(cpusPerNuma[nodeID], fmt.Sprintf("%d", cpuID))
 	}
 
 	for nodeID, cpuList := range cpusPerNuma {
-		lh.Infof("normalize CPUs NUMANode=%d, count=%d", nodeID, len(cpuList))
+		logger.V(4).Info("normalize CPUs", "numaNode", nodeID, "count", len(cpuList))
 		contDevs = append(contDevs, &podresourcesapi.ContainerDevices{
 			ResourceName: string(v1.ResourceCPU),
 			DeviceIds:    cpuList,
@@ -659,7 +670,7 @@ func NormalizeContainerDevices(lh klog.Verbose, devices []*podresourcesapi.Conta
 		}
 
 		for _, node := range block.GetTopology().GetNodes() {
-			lh.Infof("normalize MemoryBlocks NUMANode=%d size=%v", node.ID, blockSize)
+			logger.V(4).Info("normalize memory blocks", "numaNode", node.ID, "size", blockSize)
 			contDevs = append(contDevs, &podresourcesapi.ContainerDevices{
 				ResourceName: block.MemoryType,
 				DeviceIds:    []string{fmt.Sprintf("%d", blockSize)},
@@ -672,11 +683,11 @@ func NormalizeContainerDevices(lh klog.Verbose, devices []*podresourcesapi.Conta
 		}
 	}
 
-	lh.Infof("normalized container devices: entries=%d from devices=%d memoryBlocks=%d CPUs=%d", len(contDevs), len(devices), len(memoryBlocks), len(cpuIds))
+	logger.V(4).Info("normalized container devices", "entries", len(contDevs), "devices", len(devices), "memoryBlocks", len(memoryBlocks), "CPUs", len(cpuIds))
 	return contDevs
 }
 
-func ContainerDevicesToPerNUMAResourceCounters(devices []*podresourcesapi.ContainerDevices) perNUMAResourceCounter {
+func ContainerDevicesToPerNUMAResourceCounters(logger logr.Logger, devices []*podresourcesapi.ContainerDevices) perNUMAResourceCounter {
 	perNUMARc := make(perNUMAResourceCounter)
 	for _, device := range devices {
 		resourceName := device.GetResourceName()
@@ -700,7 +711,7 @@ func ContainerDevicesToPerNUMAResourceCounters(devices []*podresourcesapi.Contai
 			perNUMARc[nodeID] = nodeRes
 		}
 	}
-	klog.V(6).Infof("resmon: from devices=%d: %s", len(devices), perNUMARc.String())
+	logger.V(6).Info("container devices to per-NUMA resource counters", "devices", len(devices), "counters", perNUMARc.String())
 	return perNUMARc
 }
 

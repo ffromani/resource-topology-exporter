@@ -26,9 +26,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	v1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+
+	"github.com/go-logr/logr"
 
 	cmp "github.com/google/go-cmp/cmp"
 	ghwtopology "github.com/jaypipes/ghw/pkg/topology"
@@ -186,8 +187,7 @@ func TestNormalizeContainerDevices(t *testing.T) {
 	coreIDToNodeIDMap := getExpectedCoreToNodeMap()
 
 	Convey("When normalizing the container devices from pod resources", t, func() {
-		VL := klog.V(999) // so high that means "never" in practice
-		res := NormalizeContainerDevices(VL, availRes.GetDevices(), availRes.GetMemory(), availRes.GetCpuIds(), coreIDToNodeIDMap)
+		res := NormalizeContainerDevices(logr.Discard(), availRes.GetDevices(), availRes.GetMemory(), availRes.GetCpuIds(), coreIDToNodeIDMap)
 		expected := []*podresourcesapi.ContainerDevices{
 			{
 				ResourceName: "fake.io/net",
@@ -1663,7 +1663,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 
 func TestComputeNUMAPlacementPayload(t *testing.T) {
 	Convey("When the topology manager policy is not a single-numa-node (not supported for numaplacement encoding)", t, func() {
-		payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{
+		payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{
 			{Containers: []*podresourcesapi.ContainerResources{
 				{CpuIds: []int64{0}},
 			}},
@@ -1674,7 +1674,7 @@ func TestComputeNUMAPlacementPayload(t *testing.T) {
 	Convey("When the topology manager policy is single-numa-node", t, func() {
 		Convey("With zero pods", func() {
 			numaCount := 2
-			payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
 			assert.NotNil(t, payload)
 			assert.Equal(t, 0, payload.Containers)
 			assert.Equal(t, 0, payload.BusiestNode)
@@ -1710,7 +1710,7 @@ func TestComputeNUMAPlacementPayload(t *testing.T) {
 				},
 			}
 			numaCount := 2
-			payload := ComputeNUMAPlacementPayload(pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			payload := ComputeNUMAPlacementPayload(logr.Discard(), pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
 			assert.NotNil(t, payload)
 			assert.Equal(t, 2, payload.Containers)
 			assert.Equal(t, 1, payload.BusiestNode)
