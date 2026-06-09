@@ -1,6 +1,7 @@
 package resourcetopologyexporter
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -26,7 +27,7 @@ type ResourceObserver struct {
 
 func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args, tmPolicy string) (*ResourceObserver, error) {
 	resMon := resourcemonitor.NewResourceMonitor(hnd, args, tmPolicy)
-	if err := resMon.Setup(); err != nil {
+	if err := resMon.Setup(context.TODO()); err != nil {
 		return nil, fmt.Errorf("failed to setup ResourceMonitor: %w", err)
 	}
 
@@ -59,7 +60,7 @@ func (rm *ResourceObserver) Run(eventsChan <-chan notification.Event, condChan c
 			metrics.UpdateWakeupDelayMetric(monInfo.UpdateReason(), float64(tsWakeupDiff.Milliseconds()))
 
 			tsBegin := time.Now()
-			scanRes, err := rm.resMon.Scan(rm.resourceExclude)
+			scanRes, err := rm.resMon.Scan(context.TODO(), rm.resourceExclude)
 			tsEnd := time.Now()
 
 			monInfo.Annotations = scanRes.Annotations

@@ -129,8 +129,8 @@ func (sr ScanResponse) SortedZones() v1alpha2.ZoneList {
 }
 
 type ResourceMonitor interface {
-	Setup() error
-	Scan(excludeList ResourceExclude) (ScanResponse, error)
+	Setup(ctx context.Context) error
+	Scan(ctx context.Context, excludeList ResourceExclude) (ScanResponse, error)
 }
 
 // ToMapSet keeps the original keys, but replaces values with set.String types
@@ -208,7 +208,7 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 	return rm
 }
 
-func (rm *resourceMonitor) Setup() error {
+func (rm *resourceMonitor) Setup(ctx context.Context) error {
 	klog.Infof("resmon: starting for node %q", rm.nodeName)
 
 	if rm.topo == nil {
@@ -225,7 +225,7 @@ func (rm *resourceMonitor) Setup() error {
 	rm.coreIDToNodeIDMap = MakeCoreIDToNodeIDMap(rm.topo)
 	klog.V(4).Infof("resmon: CPU mapping [coreid:numaid]: %s", mapIntIntToString(rm.coreIDToNodeIDMap))
 
-	if err := rm.updateNodeResources(); err != nil {
+	if err := rm.updateNodeResources(ctx); err != nil {
 		return err
 	}
 	klog.V(2).Infof("resmon: initial capacity for node %q: %s", rm.nodeName, rm.nodeCapacity)
@@ -271,8 +271,8 @@ func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
 }
 
 // Scan scans the node pods using podresources API, processes the scan response and builds up the returned value.
-func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
+func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude) (ScanResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultPodResourcesTimeout)
 	defer cancel()
 	resp, err := rm.podResCli.List(ctx, &podresourcesapi.ListPodResourcesRequest{})
 	if err != nil {
@@ -521,14 +521,14 @@ func (rm *resourceMonitor) resUpdated(old, new interface{}) {
 	if !reflect.DeepEqual(nOld.Status.Capacity, nNew.Status.Capacity) ||
 		!reflect.DeepEqual(nOld.Status.Allocatable, nNew.Status.Allocatable) {
 		klog.V(2).Infof("resmon: update node resources")
-		if err := rm.updateNodeResources(); err != nil {
+		if err := rm.updateNodeResources(context.TODO()); err != nil {
 			klog.ErrorS(err, "resmon: while updating node resources")
 		}
 	}
 }
 
-func (rm *resourceMonitor) updateNodeAllocatable() error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
+func (rm *resourceMonitor) updateNodeAllocatable(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultPodResourcesTimeout)
 	defer cancel()
 	allocRes, err := rm.podResCli.GetAllocatableResources(ctx, &podresourcesapi.AllocatableResourcesRequest{})
 	if err != nil {
@@ -553,11 +553,11 @@ func (rm *resourceMonitor) updateDevicesCapacity() {
 	}
 }
 
-func (rm *resourceMonitor) updateNodeResources() error {
+func (rm *resourceMonitor) updateNodeResources(ctx context.Context) error {
 	if err := rm.updateNodeCapacity(); err != nil {
 		return fmt.Errorf("error while updating node capacity: %w", err)
 	}
-	if err := rm.updateNodeAllocatable(); err != nil {
+	if err := rm.updateNodeAllocatable(ctx); err != nil {
 		return fmt.Errorf("error while updating node allocatable: %w", err)
 	}
 	// there is no trivial way to detect devices capacity from the node.
