@@ -129,6 +129,7 @@ func (sr ScanResponse) SortedZones() v1alpha2.ZoneList {
 }
 
 type ResourceMonitor interface {
+	Setup() error
 	Scan(excludeList ResourceExclude) (ScanResponse, error)
 }
 
@@ -189,7 +190,7 @@ type resourceMonitor struct {
 	nodeAllocatable   perNUMAResourceCounter
 }
 
-func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(*resourceMonitor)) (*resourceMonitor, error) {
+func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(*resourceMonitor)) *resourceMonitor {
 	rm := &resourceMonitor{
 		podResCli: hnd.PodResCli,
 		k8sCli:    hnd.K8SCli,
@@ -204,14 +205,18 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 		rm.nodeName = os.Getenv("NODE_NAME")
 	}
 
+	return rm
+}
+
+func (rm *resourceMonitor) Setup() error {
 	klog.Infof("resmon: starting for node %q", rm.nodeName)
 
 	if rm.topo == nil {
 		topo, err := ghwtopology.New(ghwoption.WithPathOverrides(ghwoption.PathOverrides{
-			"/sys": args.SysfsRoot,
+			"/sys": rm.args.SysfsRoot,
 		}))
 		if err != nil {
-			return nil, err
+			return err
 		}
 		rm.topo = topo
 	}
@@ -221,7 +226,7 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 	klog.V(4).Infof("resmon: CPU mapping [coreid:numaid]: %s", mapIntIntToString(rm.coreIDToNodeIDMap))
 
 	if err := rm.updateNodeResources(); err != nil {
-		return nil, err
+		return err
 	}
 	klog.V(2).Infof("resmon: initial capacity for node %q: %s", rm.nodeName, rm.nodeCapacity)
 	klog.V(2).Infof("resmon: initial allocatable for node %q: %s", rm.nodeName, rm.nodeAllocatable)
@@ -231,7 +236,7 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 	} else {
 		klog.Infof("resmon: tracking node resources")
 		if err := addNodeInformerEvent(rm.k8sCli, cache.ResourceEventHandlerFuncs{UpdateFunc: rm.resUpdated}); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -240,7 +245,7 @@ func NewResourceMonitor(hnd Handle, args Args, tmPolicy string, options ...func(
 	} else {
 		klog.Infof("resmon: watching all namespaces")
 	}
-	return rm, nil
+	return nil
 }
 
 func WithTopology(topo *ghwtopology.Info) func(*resourceMonitor) {

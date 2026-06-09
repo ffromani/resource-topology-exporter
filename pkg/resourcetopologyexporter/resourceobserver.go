@@ -25,9 +25,9 @@ type ResourceObserver struct {
 }
 
 func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args, tmPolicy string) (*ResourceObserver, error) {
-	resMon, err := resourcemonitor.NewResourceMonitor(hnd, args, tmPolicy)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize ResourceMonitor: %w", err)
+	resMon := resourcemonitor.NewResourceMonitor(hnd, args, tmPolicy)
+	if err := resMon.Setup(); err != nil {
+		return nil, fmt.Errorf("failed to setup ResourceMonitor: %w", err)
 	}
 
 	resObs := ResourceObserver{
