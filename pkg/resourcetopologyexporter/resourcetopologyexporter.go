@@ -99,10 +99,15 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 		return err
 	}
 
-	resObs, err := NewResourceObserver(hnd.ResMon, resourcemonitorArgs, tmConf.config.Policy)
-	if err != nil {
-		return err
+	ctx := context.Background()
+
+	resMon := resourcemonitor.NewResourceMonitor(hnd.ResMon, resourcemonitorArgs, tmConf.config.Policy)
+	if err := resMon.Setup(ctx); err != nil {
+		return fmt.Errorf("failed to setup ResourceMonitor: %w", err)
 	}
+
+	resObs := NewResourceObserver(resMon, resourcemonitorArgs)
+
 	go resObs.Run(eventSource.Events(), condChan)
 
 	upd, err := nrtupdater.NewNRTUpdater(nodeGetter, hnd.NRTCli, nrtupdaterArgs, tmConf.config)

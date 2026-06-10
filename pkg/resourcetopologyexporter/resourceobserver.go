@@ -2,7 +2,6 @@ package resourcetopologyexporter
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -25,12 +24,7 @@ type ResourceObserver struct {
 	exposeTiming    bool
 }
 
-func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args, tmPolicy string) (*ResourceObserver, error) {
-	resMon := resourcemonitor.NewResourceMonitor(hnd, args, tmPolicy)
-	if err := resMon.Setup(context.TODO()); err != nil {
-		return nil, fmt.Errorf("failed to setup ResourceMonitor: %w", err)
-	}
-
+func NewResourceObserver(resMon resourcemonitor.ResourceMonitor, args resourcemonitor.Args) *ResourceObserver {
 	resObs := ResourceObserver{
 		resMon:          resMon,
 		resourceExclude: args.ResourceExclude,
@@ -39,7 +33,7 @@ func NewResourceObserver(hnd resourcemonitor.Handle, args resourcemonitor.Args, 
 		exposeTiming:    args.ExposeTiming,
 	}
 	resObs.Infos = resObs.infoChan
-	return &resObs, nil
+	return &resObs
 }
 
 func (rm *ResourceObserver) Stop() {
