@@ -40,7 +40,7 @@ func (rm *ResourceObserver) Stop() {
 	rm.stopChan <- struct{}{}
 }
 
-func (rm *ResourceObserver) Run(eventsChan <-chan notification.Event, condChan chan<- v1.PodCondition) {
+func (rm *ResourceObserver) Run(ctx context.Context, eventsChan <-chan notification.Event, condChan chan<- v1.PodCondition) {
 	lastWakeup := time.Now()
 	for {
 		select {
@@ -54,7 +54,7 @@ func (rm *ResourceObserver) Run(eventsChan <-chan notification.Event, condChan c
 			metrics.UpdateWakeupDelayMetric(monInfo.UpdateReason(), float64(tsWakeupDiff.Milliseconds()))
 
 			tsBegin := time.Now()
-			scanRes, err := rm.resMon.Scan(context.TODO(), rm.resourceExclude)
+			scanRes, err := rm.resMon.Scan(ctx, rm.resourceExclude)
 			tsEnd := time.Now()
 
 			monInfo.Annotations = scanRes.Annotations
@@ -78,6 +78,8 @@ func (rm *ResourceObserver) Run(eventsChan <-chan notification.Event, condChan c
 			tsDiff := tsEnd.Sub(tsBegin)
 			metrics.UpdateOperationDelayMetric("podresources_scan", monInfo.UpdateReason(), float64(tsDiff.Milliseconds()))
 			podreadiness.SetCondition(condChan, podreadiness.PodresourcesFetched, condStatus)
+		case <-ctx.Done():
+			return
 		case <-rm.stopChan:
 			klog.Infof("read stop at %v", time.Now())
 			return

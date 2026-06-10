@@ -67,7 +67,7 @@ type Handle struct {
 	NRTCli topologyclientset.Interface
 }
 
-func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs resourcemonitor.Args, rteArgs Args) error {
+func Execute(ctx context.Context, hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs resourcemonitor.Args, rteArgs Args) error {
 	tmConf, err := getTopologyManagerSettings(rteArgs)
 	if err != nil {
 		return err
@@ -75,7 +75,7 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 
 	var nodeGetter nrtupdater.NodeGetter
 	if rteArgs.AddNRTOwnerEnable {
-		nodeGetter, err = nrtupdater.NewCachedNodeGetter(hnd.ResMon.K8SCli, context.Background())
+		nodeGetter, err = nrtupdater.NewCachedNodeGetter(hnd.ResMon.K8SCli, ctx)
 		if err != nil {
 			klog.V(2).Info("Cannot enable 'add-nrt-owner'. Unable to get node info")
 			return fmt.Errorf("Cannot enable 'add-nrt-owner'. %w", err)
@@ -91,15 +91,13 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 		if err != nil {
 			return err
 		}
-		go condIn.Run(context.Background(), condChan)
+		go condIn.Run(ctx, condChan)
 	}
 
 	eventSource, err := createEventSource(&rteArgs)
 	if err != nil {
 		return err
 	}
-
-	ctx := context.Background()
 
 	resMon := resourcemonitor.NewResourceMonitor(hnd.ResMon, resourcemonitorArgs, tmConf.config.Policy)
 	if err := resMon.Setup(ctx); err != nil {
@@ -108,7 +106,7 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 
 	resObs := NewResourceObserver(resMon, resourcemonitorArgs)
 
-	go resObs.Run(eventSource.Events(), condChan)
+	go resObs.Run(ctx, eventSource.Events(), condChan)
 
 	upd, err := nrtupdater.NewNRTUpdater(nodeGetter, hnd.NRTCli, nrtupdaterArgs, tmConf.config)
 	if err != nil {
@@ -118,9 +116,13 @@ func Execute(hnd Handle, nrtupdaterArgs nrtupdater.Args, resourcemonitorArgs res
 
 	go eventSource.Run()
 
-	eventSource.Wait()  // will never return
-	eventSource.Close() // still we try to clean after ourselves :)
-	return nil          // unreachable
+	select {
+	case <-ctx.Done():
+	}
+	eventSource.Stop()
+	eventSource.Wait()
+	eventSource.Close()
+	return nil
 }
 
 func createEventSource(rteArgs *Args) (notification.EventSource, error) {
