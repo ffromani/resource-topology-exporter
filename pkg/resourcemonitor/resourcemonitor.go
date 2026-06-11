@@ -245,7 +245,9 @@ func (rm *resourceMonitor) Setup(ctx context.Context) error {
 		logger.Info("getting node resources once")
 	} else {
 		logger.Info("tracking node resources")
-		if err := addNodeInformerEvent(rm.k8sCli, cache.ResourceEventHandlerFuncs{UpdateFunc: rm.resUpdated}); err != nil {
+		if err := addNodeInformerEvent(ctx, rm.k8sCli, cache.ResourceEventHandlerFuncs{UpdateFunc: func(old, new any) {
+			rm.resUpdated(ctx, old, new)
+		}}); err != nil {
 			return err
 		}
 	}
@@ -518,7 +520,8 @@ func (rm *resourceMonitor) updateNodeCapacity() error {
 	return nil
 }
 
-func (rm *resourceMonitor) resUpdated(old, new interface{}) {
+func (rm *resourceMonitor) resUpdated(ctx context.Context, old, new any) {
+	logger := klog.FromContext(ctx)
 	nOld := old.(*v1.Node)
 	nNew := new.(*v1.Node)
 
@@ -528,9 +531,8 @@ func (rm *resourceMonitor) resUpdated(old, new interface{}) {
 
 	if !reflect.DeepEqual(nOld.Status.Capacity, nNew.Status.Capacity) ||
 		!reflect.DeepEqual(nOld.Status.Allocatable, nNew.Status.Allocatable) {
-		logger := klog.TODO()
 		logger.V(2).Info("update node resources")
-		if err := rm.updateNodeResources(context.TODO()); err != nil {
+		if err := rm.updateNodeResources(ctx); err != nil {
 			logger.Error(err, "while updating node resources")
 		}
 	}
@@ -774,11 +776,10 @@ func cpuCapacity(topo *ghwtopology.Info, nodeID int) int64 {
 	return int64(logicalCoresPerNUMA)
 }
 
-func addNodeInformerEvent(c kubernetes.Interface, handler cache.ResourceEventHandlerFuncs) error {
+func addNodeInformerEvent(ctx context.Context, c kubernetes.Interface, handler cache.ResourceEventHandlerFuncs) error {
 	factory := informers.NewSharedInformerFactory(c, 0)
 	nodeInformer := factory.Core().V1().Nodes().Informer()
 	_, _ = nodeInformer.AddEventHandler(handler)
-	ctx := context.Background()
 	factory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), nodeInformer.HasSynced) {
 		return fmt.Errorf("timed out waiting for caches to sync")
@@ -815,7 +816,7 @@ func mapIntIntToString(mii map[int]int) string {
 	return sb.String()
 }
 
-func toJSON(obj interface{}) string {
+func toJSON(obj any) string {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return "<ERROR>"

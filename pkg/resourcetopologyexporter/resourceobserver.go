@@ -41,6 +41,7 @@ func (rm *ResourceObserver) Stop() {
 }
 
 func (rm *ResourceObserver) Run(ctx context.Context, eventsChan <-chan notification.Event, condChan chan<- v1.PodCondition) {
+	logger := klog.FromContext(ctx)
 	lastWakeup := time.Now()
 	for {
 		select {
@@ -68,7 +69,7 @@ func (rm *ResourceObserver) Run(ctx context.Context, eventsChan <-chan notificat
 
 			condStatus := v1.ConditionTrue
 			if err != nil {
-				klog.Warningf("failed to scan pod resources: %v\n", err)
+				logger.V(1).Info("failed to scan pod resources", "err", err)
 				condStatus = v1.ConditionFalse
 				podreadiness.SetCondition(condChan, podreadiness.PodresourcesFetched, condStatus)
 				continue
@@ -81,7 +82,7 @@ func (rm *ResourceObserver) Run(ctx context.Context, eventsChan <-chan notificat
 		case <-ctx.Done():
 			return
 		case <-rm.stopChan:
-			klog.Infof("read stop at %v", time.Now())
+			logger.Info("read stop", "at", time.Now())
 			return
 		}
 	}
