@@ -1381,17 +1381,27 @@ func TestNewResourceMonitorTMConfig(t *testing.T) {
 	mockPodResClient.On("GetAllocatableResources", mock.Anything, mock.Anything).
 		Return(&v1.AllocatableResourcesResponse{}, nil)
 
-	tmPolicy := "single-numa-node"
 	rm := NewResourceMonitor(
 		Handle{PodResCli: mockPodResClient},
 		Args{},
-		tmPolicy,
+		"single-numa-node",
 		WithNodeName("TEST"),
 		WithTopology(&topo),
 		WithK8sClient(fake.NewSimpleClientset()),
 	)
 	assert.NoError(t, rm.Setup(context.TODO()))
-	assert.True(t, rm.HasTopologyManagerPolicy(tmPolicy))
+	assert.True(t, rm.HasSingleNUMANodeTopologyManagerPolicy())
+
+	rm = NewResourceMonitor(
+		Handle{PodResCli: mockPodResClient},
+		Args{},
+		"",
+		WithNodeName("TEST"),
+		WithTopology(&topo),
+		WithK8sClient(fake.NewSimpleClientset()),
+	)
+	assert.NoError(t, rm.Setup(context.TODO()))
+	assert.False(t, rm.HasSingleNUMANodeTopologyManagerPolicy())
 }
 
 func TestScanNUMAPlacementAttributes(t *testing.T) {

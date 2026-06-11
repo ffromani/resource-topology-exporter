@@ -275,8 +275,8 @@ func WithNodeName(name string) func(*resourceMonitor) {
 	}
 }
 
-func (rm *resourceMonitor) HasTopologyManagerPolicy(policy string) bool {
-	return rm.tmPolicy == policy
+func (rm *resourceMonitor) HasSingleNUMANodeTopologyManagerPolicy() bool {
+	return rm.tmPolicy == TopologyManagerPolicySingleNUMANode
 }
 
 // Scan scans the node pods using podresources API, processes the scan response and builds up the returned value.
