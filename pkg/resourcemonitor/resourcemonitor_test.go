@@ -17,6 +17,7 @@ limitations under the License.
 package resourcemonitor
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sort"
@@ -25,9 +26,10 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes/fake"
-	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	v1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+
+	"github.com/go-logr/logr"
 
 	cmp "github.com/google/go-cmp/cmp"
 	ghwtopology "github.com/jaypipes/ghw/pkg/topology"
@@ -185,8 +187,7 @@ func TestNormalizeContainerDevices(t *testing.T) {
 	coreIDToNodeIDMap := getExpectedCoreToNodeMap()
 
 	Convey("When normalizing the container devices from pod resources", t, func() {
-		VL := klog.V(999) // so high that means "never" in practice
-		res := NormalizeContainerDevices(VL, availRes.GetDevices(), availRes.GetMemory(), availRes.GetCpuIds(), coreIDToNodeIDMap)
+		res := NormalizeContainerDevices(logr.Discard(), availRes.GetDevices(), availRes.GetMemory(), availRes.GetCpuIds(), coreIDToNodeIDMap)
 		expected := []*podresourcesapi.ContainerDevices{
 			{
 				ResourceName: "fake.io/net",
@@ -463,7 +464,8 @@ func TestResourcesScan(t *testing.T) {
 
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(availRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -536,7 +538,7 @@ func TestResourcesScan(t *testing.T) {
 				PodResources: []*v1.PodResources{},
 			}
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(ResourceExclude{}) // no pods allocation
+			scanRes, err := resMon.Scan(context.TODO(), ResourceExclude{}) // no pods allocation
 			So(err, ShouldBeNil)
 
 			res := scanRes.SortedZones()
@@ -560,7 +562,8 @@ func TestResourcesScan(t *testing.T) {
 
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(availRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -633,7 +636,7 @@ func TestResourcesScan(t *testing.T) {
 				PodResources: []*v1.PodResources{},
 			}
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(ResourceExclude{}) // no pods allocation
+			scanRes, err := resMon.Scan(context.TODO(), ResourceExclude{}) // no pods allocation
 			So(err, ShouldBeNil)
 
 			res := scanRes.SortedZones()
@@ -713,7 +716,8 @@ func TestResourcesScan(t *testing.T) {
 
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(allocRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -829,7 +833,7 @@ func TestResourcesScan(t *testing.T) {
 			}
 
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(excludeList)
+			scanRes, err := resMon.Scan(context.TODO(), excludeList)
 			So(err, ShouldBeNil)
 
 			res := scanRes.Zones.DeepCopy()
@@ -884,7 +888,8 @@ func TestResourcesScan(t *testing.T) {
 
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(allocRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -1000,7 +1005,7 @@ func TestResourcesScan(t *testing.T) {
 			}
 
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(excludeList)
+			scanRes, err := resMon.Scan(context.TODO(), excludeList)
 			So(err, ShouldBeNil)
 
 			res := scanRes.Zones.DeepCopy()
@@ -1107,7 +1112,8 @@ func TestResourcesScan(t *testing.T) {
 		}
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(allocRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{RefreshNodeResources: true}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{RefreshNodeResources: true}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -1223,7 +1229,7 @@ func TestResourcesScan(t *testing.T) {
 			}
 
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(excludeList)
+			scanRes, err := resMon.Scan(context.TODO(), excludeList)
 			So(err, ShouldBeNil)
 
 			res := scanRes.Zones.DeepCopy()
@@ -1277,7 +1283,8 @@ func TestResourcesScan(t *testing.T) {
 
 		mockPodResClient := new(podres.MockPodResourcesListerClient)
 		mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(availRes, nil)
-		resMon, err := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{PodSetFingerprint: true}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		resMon := NewResourceMonitor(Handle{PodResCli: mockPodResClient}, Args{PodSetFingerprint: true}, "", WithNodeName("TEST"), WithTopology(&fakeTopo), WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
 		Convey("When aggregating resources", func() {
@@ -1353,7 +1360,7 @@ func TestResourcesScan(t *testing.T) {
 
 			mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(allocRes, nil)
 			mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(resp, nil)
-			scanRes, err := resMon.Scan(ResourceExclude{})
+			scanRes, err := resMon.Scan(context.TODO(), ResourceExclude{})
 
 			expectedFP := "pfp0v001fe53c4dbd2c5f4a0" // pre-computed and validated manually
 			fp, ok := scanRes.Annotations[podfingerprint.Annotation]
@@ -1375,7 +1382,7 @@ func TestNewResourceMonitorTMConfig(t *testing.T) {
 		Return(&v1.AllocatableResourcesResponse{}, nil)
 
 	tmPolicy := "single-numa-node"
-	rm, err := NewResourceMonitor(
+	rm := NewResourceMonitor(
 		Handle{PodResCli: mockPodResClient},
 		Args{},
 		tmPolicy,
@@ -1383,7 +1390,7 @@ func TestNewResourceMonitorTMConfig(t *testing.T) {
 		WithTopology(&topo),
 		WithK8sClient(fake.NewSimpleClientset()),
 	)
-	assert.NoError(t, err)
+	assert.NoError(t, rm.Setup(context.TODO()))
 	assert.True(t, rm.HasTopologyManagerPolicy(tmPolicy))
 }
 
@@ -1518,7 +1525,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		}
 		mockPodResClient := newPodResMock(listResp)
 
-		resMon, err := NewResourceMonitor(
+		resMon := NewResourceMonitor(
 			Handle{PodResCli: mockPodResClient},
 			Args{
 				PodSetFingerprint:       true,
@@ -1528,9 +1535,10 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 			WithNodeName("TEST"),
 			WithTopology(&fakeTopo),
 			WithK8sClient(fake.NewSimpleClientset()))
+		err := resMon.Setup(context.TODO())
 		So(err, ShouldBeNil)
 
-		scanRes, err := resMon.Scan(ResourceExclude{})
+		scanRes, err := resMon.Scan(context.TODO(), ResourceExclude{})
 		So(err, ShouldBeNil)
 
 		metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
@@ -1575,7 +1583,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		}
 		mockPodResClient := newPodResMock(listResp)
 
-		rm, err := NewResourceMonitor(
+		rm := NewResourceMonitor(
 			Handle{PodResCli: mockPodResClient},
 			Args{
 				PodSetFingerprint:       true,
@@ -1585,9 +1593,9 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 			WithNodeName("TEST"),
 			WithTopology(&fakeTopo),
 			WithK8sClient(fake.NewSimpleClientset()))
-		assert.NoError(t, err)
+		assert.NoError(t, rm.Setup(context.TODO()))
 
-		scanRes, err := rm.Scan(ResourceExclude{})
+		scanRes, err := rm.Scan(context.TODO(), ResourceExclude{})
 		assert.NoError(t, err)
 
 		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
@@ -1611,7 +1619,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 		}
 		mockPodResClient := newPodResMock(listResp)
 
-		rm, err := NewResourceMonitor(
+		rm := NewResourceMonitor(
 			Handle{PodResCli: mockPodResClient},
 			Args{
 				PodSetFingerprint:       true,
@@ -1621,9 +1629,9 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 			WithNodeName("TEST"),
 			WithTopology(&fakeTopo),
 			WithK8sClient(fake.NewSimpleClientset()))
-		assert.NoError(t, err)
+		assert.NoError(t, rm.Setup(context.TODO()))
 
-		scanRes, err := rm.Scan(ResourceExclude{})
+		scanRes, err := rm.Scan(context.TODO(), ResourceExclude{})
 		assert.NoError(t, err)
 
 		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
@@ -1634,16 +1642,16 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 
 	Convey("When PFP is disabled, no NUMA placement metadata is added", t, func() {
 		mockPodResClient := newPodResMock(&podresourcesapi.ListPodResourcesResponse{})
-		rm, err := NewResourceMonitor(
+		rm := NewResourceMonitor(
 			Handle{PodResCli: mockPodResClient},
 			Args{PodSetFingerprint: false},
 			TopologyManagerPolicySingleNUMANode,
 			WithNodeName("TEST"),
 			WithTopology(&fakeTopo),
 			WithK8sClient(fake.NewSimpleClientset()))
-		assert.NoError(t, err)
+		assert.NoError(t, rm.Setup(context.TODO()))
 
-		scanRes, err := rm.Scan(ResourceExclude{})
+		scanRes, err := rm.Scan(context.TODO(), ResourceExclude{})
 		assert.NoError(t, err)
 
 		_, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
@@ -1655,7 +1663,7 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 
 func TestComputeNUMAPlacementPayload(t *testing.T) {
 	Convey("When the topology manager policy is not a single-numa-node (not supported for numaplacement encoding)", t, func() {
-		payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{
+		payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{
 			{Containers: []*podresourcesapi.ContainerResources{
 				{CpuIds: []int64{0}},
 			}},
@@ -1666,7 +1674,7 @@ func TestComputeNUMAPlacementPayload(t *testing.T) {
 	Convey("When the topology manager policy is single-numa-node", t, func() {
 		Convey("With zero pods", func() {
 			numaCount := 2
-			payload := ComputeNUMAPlacementPayload([]*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
 			assert.NotNil(t, payload)
 			assert.Equal(t, 0, payload.Containers)
 			assert.Equal(t, 0, payload.BusiestNode)
@@ -1702,7 +1710,7 @@ func TestComputeNUMAPlacementPayload(t *testing.T) {
 				},
 			}
 			numaCount := 2
-			payload := ComputeNUMAPlacementPayload(pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			payload := ComputeNUMAPlacementPayload(logr.Discard(), pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
 			assert.NotNil(t, payload)
 			assert.Equal(t, 2, payload.Containers)
 			assert.Equal(t, 1, payload.BusiestNode)
