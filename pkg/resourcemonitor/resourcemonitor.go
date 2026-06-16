@@ -310,7 +310,7 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 		Annotations: map[string]string{},
 	}
 
-	var payload *numaplacement.Payload
+	var payload numaplacement.Payload
 	if rm.args.PodSetFingerprint {
 		st := podfingerprint.MakeStatus(rm.nodeName)
 		pfpPodResources := numaEligiblePodRes
@@ -334,8 +334,9 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 		// numaplacement encoding is only done for pods that are eligible for NUMA placement (with
 		// exclusive resources), which are a subset of pods that are participating in PFP (it is
 		// not always the same pods as PFP because it depends on the filter function used)
-		payload = ComputeNUMAPlacementPayload(logger, numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
-		if payload != nil {
+		payload, err = ComputeNUMAPlacementPayload(logger, numaEligiblePodRes, rm.tmPolicy, len(rm.topo.Nodes), rm.coreIDToNodeIDMap)
+		logger.V(2).Info("containers NUMA-placement detection", "error", err)
+		if err == nil {
 			metadata := payload.PackMetadata()
 			scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
 				Name:  numaplacement.AttributeMetadata,
@@ -358,15 +359,12 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 			Resources: make(topologyv1alpha2.ResourceInfoList, 0),
 		}
 
-		// if there is only one NUMA node then adding the vector attribute is not needed because it will be the busiest
-		if payload != nil && payload.NUMANodes > 1 {
-			zoneVector, ok := payload.Vectors[nodeID]
-			if ok {
-				zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
-					Name:  numaplacement.AttributeVector,
-					Value: zoneVector,
-				})
-			}
+		zoneVector, ok := payload.Vectors[nodeID]
+		if ok {
+			zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
+				Name:  numaplacement.AttributeVector,
+				Value: zoneVector,
+			})
 		}
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
@@ -439,18 +437,16 @@ func (rm *resourceMonitor) Scan(ctx context.Context, excludeList ResourceExclude
 	return scanRes, nil
 }
 
-func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) *numaplacement.Payload {
+func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podresourcesapi.PodResources, topologyManagerPolicy string, nodesCount int, coreIDToNodeIDMap map[int]int) (numaplacement.Payload, error) {
 	// computing payload is valuable only on singleNumaNode policy because only under that
 	// condition there will be 1:1 stable mapping between the containers to the NUMA nodes.
 	if topologyManagerPolicy != TopologyManagerPolicySingleNUMANode {
-		logger.V(4).Info("topology manager policy not supported for NUMA placement", "policy", topologyManagerPolicy)
-		return nil
+		return numaplacement.Payload{}, fmt.Errorf("topology manager policy not supported for NUMA placement: %s", topologyManagerPolicy)
 	}
 
 	enc, err := numaplacement.NewEncoder(nodesCount)
 	if err != nil {
-		logger.Error(err, "while creating NUMA placement encoder")
-		return nil
+		return numaplacement.Payload{}, fmt.Errorf("while creating NUMA placement encoder: %w", err)
 	}
 
 	// Important:the consumer should apply the same filter on the pods' containers to be able
@@ -465,8 +461,7 @@ func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podre
 			}
 			numaNodeID, err := getContainerSingleNUMAPlacement(cnt, coreIDToNodeIDMap)
 			if err != nil {
-				logger.Error(err, "while getting container NUMA placement", "ident", cntID.String())
-				return nil
+				return numaplacement.Payload{}, fmt.Errorf("while getting container NUMA placement: containerID=%s, error=%w", cntID.String(), err)
 			}
 			if numaNodeID == -1 {
 				// it's possible that a container does not belong to specific NUMA node (e.g. using shared pool resources)
@@ -479,8 +474,7 @@ func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podre
 				NUMANode: numaNodeID,
 			})
 			if err != nil {
-				logger.Error(err, "while encoding container NUMA affinity", "ident", cntID.String())
-				return nil
+				return numaplacement.Payload{}, fmt.Errorf("while encoding container NUMA affinity: containerID=%s, error=%w", cntID.String(), err)
 			}
 			logger.V(6).Info("encoded container NUMA Affinity", "ident", cntID.String(), "numaNode", numaNodeID)
 		}
@@ -488,11 +482,15 @@ func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podre
 
 	payload, err := enc.Result()
 	if err != nil {
-		logger.Error(err, "while getting NUMA placement encoder result")
-		return nil
+		return numaplacement.Payload{}, fmt.Errorf("while getting NUMA placement encoder result: error=%w", err)
 	}
-	logger.V(4).Info("encoded NUMA placement payload", "containers", payload.Containers, "numaNodes", payload.NUMANodes, "encoding", payload.VectorEncoding)
-	return &payload
+
+	logger.V(4).Info("encoded NUMA placement payload",
+		"containers", payload.Containers,
+		"numaNodes", payload.NUMANodes,
+		"busiestNode", payload.BusiestNode,
+		"encoding", payload.VectorEncoding)
+	return payload, nil
 }
 
 func (rm *resourceMonitor) updateNodeCapacity() error {
