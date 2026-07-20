@@ -485,6 +485,7 @@ func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podre
 				logger.Error(err, "while encoding container NUMA affinity", "ident", cntID.String())
 				return nil
 			}
+			logger.V(6).Info("encoded container NUMA Affinity", "ident", cntID.String(), "numaNode", numaNodeID)
 		}
 	}
 
@@ -493,6 +494,7 @@ func ComputeNUMAPlacementPayload(logger logr.Logger, numaEligiblePodRes []*podre
 		logger.Error(err, "while getting NUMA placement encoder result")
 		return nil
 	}
+	logger.V(4).Info("encoded NUMA placement payload", "containers", payload.Containers, "numaNodes", payload.NUMANodes, "encoding", payload.VectorEncoding)
 	return &payload
 }
 
