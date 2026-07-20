@@ -1381,17 +1381,27 @@ func TestNewResourceMonitorTMConfig(t *testing.T) {
 	mockPodResClient.On("GetAllocatableResources", mock.Anything, mock.Anything).
 		Return(&v1.AllocatableResourcesResponse{}, nil)
 
-	tmPolicy := "single-numa-node"
 	rm := NewResourceMonitor(
 		Handle{PodResCli: mockPodResClient},
 		Args{},
-		tmPolicy,
+		"single-numa-node",
 		WithNodeName("TEST"),
 		WithTopology(&topo),
 		WithK8sClient(fake.NewSimpleClientset()),
 	)
 	assert.NoError(t, rm.Setup(context.TODO()))
-	assert.True(t, rm.HasTopologyManagerPolicy(tmPolicy))
+	assert.True(t, rm.HasSingleNUMANodeTopologyManagerPolicy())
+
+	rm = NewResourceMonitor(
+		Handle{PodResCli: mockPodResClient},
+		Args{},
+		"",
+		WithNodeName("TEST"),
+		WithTopology(&topo),
+		WithK8sClient(fake.NewSimpleClientset()),
+	)
+	assert.NoError(t, rm.Setup(context.TODO()))
+	assert.False(t, rm.HasSingleNUMANodeTopologyManagerPolicy())
 }
 
 func TestScanNUMAPlacementAttributes(t *testing.T) {
@@ -1663,21 +1673,25 @@ func TestScanNUMAPlacementAttributes(t *testing.T) {
 
 func TestComputeNUMAPlacementPayload(t *testing.T) {
 	Convey("When the topology manager policy is not a single-numa-node (not supported for numaplacement encoding)", t, func() {
-		payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{
+		payload, err := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{
 			{Containers: []*podresourcesapi.ContainerResources{
 				{CpuIds: []int64{0}},
 			}},
 		}, "None", 2, getExpectedCoreToNodeMap())
-		assert.Nil(t, payload)
+		assert.Error(t, err)
+		assert.Equal(t, err.Error(), "topology manager policy not supported for NUMA placement: None")
+		assert.Equal(t, numaplacement.Payload{}, payload)
 	})
 
 	Convey("When the topology manager policy is single-numa-node", t, func() {
 		Convey("With zero pods", func() {
 			numaCount := 2
-			payload := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
-			assert.NotNil(t, payload)
+			payload, err := ComputeNUMAPlacementPayload(logr.Discard(), []*podresourcesapi.PodResources{}, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			assert.NoError(t, err)
 			assert.Equal(t, 0, payload.Containers)
 			assert.Equal(t, 0, payload.BusiestNode)
+			assert.Equal(t, numaCount, payload.NUMANodes)
+
 		})
 
 		Convey("With valid numa-eligible pods", func() {
@@ -1708,12 +1722,36 @@ func TestComputeNUMAPlacementPayload(t *testing.T) {
 						},
 					},
 				},
+				{
+					//guaranteed-like:
+					Name:      "tp3",
+					Namespace: "default",
+					Containers: []*podresourcesapi.ContainerResources{
+						{ //numa-eligible container, reason:cpus
+							Name:   "cnt4",
+							CpuIds: []int64{0, 2},
+						},
+					},
+				},
 			}
-			numaCount := 2
-			payload := ComputeNUMAPlacementPayload(logr.Discard(), pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
-			assert.NotNil(t, payload)
-			assert.Equal(t, 2, payload.Containers)
+			numaCount := 3
+			payload, err := ComputeNUMAPlacementPayload(logr.Discard(), pods, TopologyManagerPolicySingleNUMANode, numaCount, getExpectedCoreToNodeMap())
+			assert.NoError(t, err)
+			assert.Equal(t, 3, payload.Containers)
 			assert.Equal(t, 1, payload.BusiestNode)
+			assert.Equal(t, numaCount, payload.NUMANodes)
+
+			vectorNuma0, ok := payload.Vectors[0]
+			assert.True(t, ok)
+			assert.Equal(t, "!", vectorNuma0)
+
+			// NUMA 1 is the busiest, it should have no vector
+			_, ok = payload.Vectors[1]
+			assert.False(t, ok)
+
+			// NUMA 2 has 0 container, hence it should have no vector
+			_, ok = payload.Vectors[2]
+			assert.False(t, ok)
 		})
 
 	})
